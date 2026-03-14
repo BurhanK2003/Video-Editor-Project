@@ -44,6 +44,12 @@ Optional transcription upgrade:
 & "E:/Personal Projects/Video-Editor-Project/.venv/Scripts/python.exe" -m pip install faster-whisper
 ```
 
+Optional Phase 1 AI semantic matching upgrade:
+
+```powershell
+& "E:/Personal Projects/Video-Editor-Project/.venv/Scripts/python.exe" -m pip install sentence-transformers
+```
+
 Optional stock footage setup:
 
 ```powershell
@@ -62,6 +68,16 @@ The app will read `PEXELS_API_KEY` and `PIXABAY_API_KEY` from the process enviro
 ```
 
 If you leave `Clips Folder` empty, keep stock fetching enabled and optionally enter `Stock Search` keywords such as `city skyline, office, teamwork`. When local footage is missing, the app will try transcript-based searches first and download stock clips into `output/_stock_cache`.
+
+Phase 1 AI matching now does three things:
+
+- Extracts scene keywords from transcript segments.
+- Uses those keywords to search stock clips.
+- Picks the best clip per scene using semantic matching (when `sentence-transformers` is installed) or keyword overlap fallback.
+
+Check the log panel for lines like:
+
+- `Scene 3: keywords=brain, cells, neuron | query='brain cells neuron' | chosen=pexels_12345.mp4`
 
 ## Notes
 

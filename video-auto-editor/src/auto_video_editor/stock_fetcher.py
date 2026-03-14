@@ -9,6 +9,7 @@ from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .matcher import suggest_scene_keywords
 from .models import PlannedSegment
 
 STOP_WORDS = {
@@ -38,8 +39,9 @@ STOP_WORDS = {
     "would",
 }
 DEFAULT_QUERIES = ["background", "nature", "business", "people"]
-MIN_DOWNLOADS_PER_KEYWORD = 3
+MIN_DOWNLOADS_PER_KEYWORD = 1
 MAX_RESULTS_PER_KEYWORD = 5
+MAX_DOWNLOADS_PER_KEYWORD = 2
 USER_AGENT = "local-auto-video-editor/1.0"
 
 
@@ -105,20 +107,12 @@ def _build_queries(plan: list[PlannedSegment], keywords_override: str) -> list[s
         )
 
     derived = []
-    for segment in plan[:8]:
-        query = _segment_to_query(segment.text)
-        if query:
-            derived.append(query)
+    for segment in plan[:10]:
+        keywords = suggest_scene_keywords(segment.text, max_keywords=3)
+        if keywords:
+            derived.append(" ".join(keywords))
 
     return _dedupe(derived + DEFAULT_QUERIES)
-
-
-def _segment_to_query(text: str) -> str | None:
-    words = re.findall(r"[a-zA-Z']+", text.lower())
-    filtered = [word for word in words if len(word) > 2 and word not in STOP_WORDS]
-    if not filtered:
-        return None
-    return " ".join(filtered[:3])
 
 
 def _download_from_pexels(
@@ -133,6 +127,9 @@ def _download_from_pexels(
 ) -> list[Path]:
     results: list[Path] = []
     for query in queries:
+        if len(results) >= target_count:
+            log(f"Pexels download target reached ({target_count}). Stopping further keyword searches.")
+            break
         log(f"Searching Pexels for: {query}")
         params = urlencode({"query": query, "per_page": MAX_RESULTS_PER_KEYWORD, "orientation": "landscape"})
         request = Request(
@@ -149,16 +146,26 @@ def _download_from_pexels(
         found = payload.get("videos", [])
         log(f"Pexels results for '{query}': {len(found)}")
 
+        downloaded_for_query = 0
         for video in found:
             if len(results) >= target_count:
+                break
+            if downloaded_for_query >= MAX_DOWNLOADS_PER_KEYWORD:
                 break
             video_url = _select_pexels_video_url(video, width, height)
             if not video_url:
                 continue
             destination = cache_dir / f"pexels_{video['id']}.mp4"
-            clip_path = _download_video(video_url, destination, seen_paths, log)
+            metadata = {
+                "provider": "pexels",
+                "query": query,
+                "title": str(video.get("url") or ""),
+                "tags": "",
+            }
+            clip_path = _download_video(video_url, destination, seen_paths, log, metadata)
             if clip_path is not None:
                 results.append(clip_path)
+                downloaded_for_query += 1
     return results
 
 
@@ -174,6 +181,9 @@ def _download_from_pixabay(
 ) -> list[Path]:
     results: list[Path] = []
     for query in queries:
+        if len(results) >= target_count:
+            log(f"Pixabay download target reached ({target_count}). Stopping further keyword searches.")
+            break
         log(f"Searching Pixabay for: {query}")
         params = urlencode({"key": api_key, "q": query, "per_page": MAX_RESULTS_PER_KEYWORD})
         request = Request(
@@ -190,16 +200,26 @@ def _download_from_pixabay(
         found = payload.get("hits", [])
         log(f"Pixabay results for '{query}': {len(found)}")
 
+        downloaded_for_query = 0
         for video in found:
             if len(results) >= target_count:
+                break
+            if downloaded_for_query >= MAX_DOWNLOADS_PER_KEYWORD:
                 break
             video_url = _select_pixabay_video_url(video, width, height)
             if not video_url:
                 continue
             destination = cache_dir / f"pixabay_{video['id']}.mp4"
-            clip_path = _download_video(video_url, destination, seen_paths, log)
+            metadata = {
+                "provider": "pixabay",
+                "query": query,
+                "title": str(video.get("pageURL") or ""),
+                "tags": str(video.get("tags") or ""),
+            }
+            clip_path = _download_video(video_url, destination, seen_paths, log, metadata)
             if clip_path is not None:
                 results.append(clip_path)
+                downloaded_for_query += 1
     return results
 
 
@@ -245,13 +265,20 @@ def _resolution_score(file_width: int, file_height: int, target_width: int, targ
     return fit_bonus + (file_width * file_height)
 
 
-def _download_video(url: str, destination: Path, seen_paths: set[Path], log: callable) -> Path | None:
+def _download_video(
+    url: str,
+    destination: Path,
+    seen_paths: set[Path],
+    log: callable,
+    metadata: dict,
+) -> Path | None:
     if destination in seen_paths:
         return None
     destination.parent.mkdir(parents=True, exist_ok=True)
     seen_paths.add(destination)
 
     if destination.exists() and destination.stat().st_size > 0:
+        _write_metadata_sidecar(destination, metadata)
         log(f"Using cached stock clip: {destination.name}")
         return destination
 
@@ -261,6 +288,7 @@ def _download_video(url: str, destination: Path, seen_paths: set[Path], log: cal
         with urlopen(request, timeout=60) as response, temp_path.open("wb") as handle:
             shutil.copyfileobj(response, handle)
         temp_path.replace(destination)
+        _write_metadata_sidecar(destination, metadata)
         log(f"Downloaded stock clip: {destination.name}")
         return destination
     except Exception as exc:
@@ -268,6 +296,17 @@ def _download_video(url: str, destination: Path, seen_paths: set[Path], log: cal
             temp_path.unlink(missing_ok=True)
         log(f"Stock clip download failed for {destination.name}: {exc}")
         return None
+
+
+def _write_metadata_sidecar(destination: Path, metadata: dict) -> None:
+    sidecar = destination.with_suffix(destination.suffix + ".json")
+    payload = {
+        "provider": str(metadata.get("provider") or ""),
+        "query": str(metadata.get("query") or ""),
+        "title": str(metadata.get("title") or ""),
+        "tags": str(metadata.get("tags") or ""),
+    }
+    sidecar.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 def _read_setting(name: str) -> str:
@@ -326,6 +365,9 @@ def _dedupe(items: Iterable[str]) -> list[str]:
 
 
 def _target_clip_count(plan: list[PlannedSegment], queries: list[str], keywords_override: str) -> int:
-    if keywords_override.strip() and queries:
-        return min(max(len(plan), MIN_DOWNLOADS_PER_KEYWORD * len(queries)), 30)
+    if queries:
+        # Keep 1-2 clips per keyword and avoid exploding the download count.
+        keyword_scaled_target = MIN_DOWNLOADS_PER_KEYWORD * len(queries)
+        hard_cap = MAX_DOWNLOADS_PER_KEYWORD * len(queries)
+        return min(max(len(plan), keyword_scaled_target), hard_cap)
     return min(max(3, len(plan)), 8)

@@ -1,3 +1,5 @@
 .env
-#ignore the output folder and all its contents
-output/
+#ignore the content of the output folder and all its contents
+output
+my/
+.venv/

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -20,56 +20,40 @@ def transcribe_voiceover(
     try:
         from faster_whisper import WhisperModel
     except Exception:
-        log("faster-whisper not available. Trying openai-whisper.")
-    else:
-        try:
-            log(f"Loading faster-whisper model: {model_size}")
-            model = WhisperModel(model_size, device="cpu", compute_type="int8")
-            raw_segments, _ = model.transcribe(
-                str(voiceover_path),
-                beam_size=3,
-                vad_filter=True,
-            )
-            segments = [
-                TranscriptSegment(
-                    start=float(seg.start),
-                    end=float(seg.end),
-                    text=(seg.text or "").strip(),
-                )
-                for seg in raw_segments
-                if (seg.text or "").strip()
-            ]
-            if segments:
-                return segments
-            log("faster-whisper produced no segments. Trying openai-whisper.")
-        except Exception as exc:
-            log(f"faster-whisper failed ({exc}). Trying openai-whisper.")
+        duration = _audio_duration_seconds(voiceover_path)
+        log("faster-whisper not available. Falling back to a single segment.")
+        return [
+            TranscriptSegment(start=0.0, end=duration, text="Voiceover segment")
+        ]
 
     try:
-        import whisper
-
-        log(f"Loading openai-whisper model: {model_size}")
-        model = whisper.load_model(model_size)
-        result = model.transcribe(str(voiceover_path), task="transcribe")
-        segments: list[TranscriptSegment] = []
-        for seg in result.get("segments", []):
-            text = str(seg.get("text") or "").strip()
-            if not text:
-                continue
-            segments.append(
-                TranscriptSegment(
-                    start=float(seg.get("start", 0.0)),
-                    end=float(seg.get("end", 0.0)),
-                    text=text,
-                )
+        log(f"Loading faster-whisper model: {model_size}")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        raw_segments, _ = model.transcribe(
+            str(voiceover_path),
+            beam_size=3,
+            vad_filter=True,
+        )
+        segments = [
+            TranscriptSegment(
+                start=float(seg.start),
+                end=float(seg.end),
+                text=(seg.text or "").strip(),
             )
+            for seg in raw_segments
+            if (seg.text or "").strip()
+        ]
         if segments:
             return segments
-        log("openai-whisper produced no segments. Falling back to a single segment.")
-    except Exception as exc:
-        log(f"openai-whisper failed ({exc}). Falling back to a single segment.")
 
-    duration = _audio_duration_seconds(voiceover_path)
-    return [
-        TranscriptSegment(start=0.0, end=duration, text="Voiceover segment")
-    ]
+        duration = _audio_duration_seconds(voiceover_path)
+        log("No transcript produced. Falling back to a single segment.")
+        return [
+            TranscriptSegment(start=0.0, end=duration, text="Voiceover segment")
+        ]
+    except Exception as exc:
+        duration = _audio_duration_seconds(voiceover_path)
+        log(f"Transcription failed ({exc}). Falling back to a single segment.")
+        return [
+            TranscriptSegment(start=0.0, end=duration, text="Voiceover segment")
+        ]

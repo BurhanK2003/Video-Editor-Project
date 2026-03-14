@@ -36,7 +36,7 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
         )
     log(f"Available source clips: {len(clips)}")
 
-    timeline = assign_clips(plan, clips)
+    timeline = assign_clips(plan, clips, log=log)
     log(f"Timeline shots: {len(timeline)}")
 
     render_video(
