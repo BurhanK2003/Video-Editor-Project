@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import os
+import random
+from pathlib import Path
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from moviepy.audio.AudioClip import CompositeAudioClip
+from moviepy.audio.fx.all import audio_loop
+from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoFileClip, concatenate_videoclips
+
+from .models import PlannedSegment, TimelineClip
+
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+
+
+def _fit_clip_to_canvas(clip: VideoFileClip, width: int, height: int) -> VideoFileClip:
+    """Scale to fill target frame and center-crop to preserve aspect ratio."""
+    target_ratio = width / height
+    source_ratio = clip.w / clip.h
+
+    if source_ratio > target_ratio:
+        resized = clip.resize(height=height)
+    else:
+        resized = clip.resize(width=width)
+
+    return resized.crop(x_center=resized.w / 2, y_center=resized.h / 2, width=width, height=height)
+
+
+def _pick_music_track(music_folder: Path | None) -> Path | None:
+    if not music_folder or not music_folder.exists():
+        return None
+    tracks = [
+        p
+        for p in sorted(music_folder.rglob("*"))
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+    if not tracks:
+        return None
+    return random.choice(tracks)
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+    words = text.strip().split()
+    if not words:
+        return ""
+
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join([*current, word])
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if current and (bbox[2] - bbox[0]) > max_width:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(lines[:3])
+
+
+def _load_caption_font(height: int) -> ImageFont.ImageFont:
+    size = max(28, int(height * 0.03))
+    for name in ("arial.ttf", "segoeui.ttf", "calibri.ttf"):
+        try:
+            return ImageFont.truetype(name, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _subtitle_overlays(
+    subtitle_plan: list[PlannedSegment],
+    width: int,
+    height: int,
+    final_duration: float,
+) -> list[ImageClip]:
+    if not subtitle_plan:
+        return []
+
+    box_height = max(200, int(height * 0.22))
+    max_text_width = int(width * 0.84)
+    overlays: list[ImageClip] = []
+
+    for segment in subtitle_plan:
+        start = max(0.0, float(segment.start))
+        end = min(final_duration, float(segment.end))
+        if end <= start:
+            continue
+        text = (segment.text or "").strip()
+        if not text:
+            continue
+
+        image = Image.new("RGBA", (width, box_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        font = _load_caption_font(height)
+
+        wrapped = _wrap_text(draw, text, font, max_text_width)
+        if not wrapped:
+            continue
+
+        bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=6)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        pad_x = 28
+        pad_y = 18
+        rect_w = min(width - 20, text_w + pad_x * 2)
+        rect_h = text_h + pad_y * 2
+        rect_x0 = (width - rect_w) // 2
+        rect_y0 = (box_height - rect_h) // 2
+        rect_x1 = rect_x0 + rect_w
+        rect_y1 = rect_y0 + rect_h
+
+        # Layered rounded cards create a more polished subtitle style.
+        draw.rounded_rectangle(
+            (rect_x0 + 5, rect_y0 + 5, rect_x1 + 5, rect_y1 + 5),
+            radius=14,
+            fill=(0, 0, 0, 90),
+        )
+        draw.rounded_rectangle(
+            (rect_x0, rect_y0, rect_x1, rect_y1),
+            radius=14,
+            fill=(20, 20, 20, 190),
+        )
+
+        accent_h = max(6, int(rect_h * 0.12))
+        draw.rounded_rectangle(
+            (rect_x0, rect_y0, rect_x1, rect_y0 + accent_h),
+            radius=14,
+            fill=(255, 196, 0, 220),
+        )
+
+        text_x = (width - text_w) // 2
+        text_y = (box_height - text_h) // 2
+        draw.multiline_text(
+            (text_x, text_y),
+            wrapped,
+            font=font,
+            fill=(255, 255, 255, 255),
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 230),
+            align="center",
+            spacing=6,
+        )
+
+        arr = np.array(image)
+        clip = (
+            ImageClip(arr)
+            .set_start(start)
+            .set_end(end)
+            .set_position(("center", int(height * 0.60)))
+        )
+        overlays.append(clip)
+
+    return overlays
+
+
+def render_video(
+    timeline_clips: list[TimelineClip],
+    subtitle_plan: list[PlannedSegment],
+    voiceover_path: Path,
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: int,
+    render_preset: str,
+    music_folder: Path | None,
+    log: callable,
+) -> None:
+    if not timeline_clips:
+        raise ValueError("No timeline clips available. Add clips in the clips folder.")
+
+    assembled = []
+    opened_video_clips: list[VideoFileClip] = []
+    subtitle_clips: list[ImageClip] = []
+    voiceover_clip: AudioFileClip | None = None
+    music_clip: AudioFileClip | None = None
+    final_video = None
+
+    try:
+        for shot in timeline_clips:
+            needed = max(0.2, float(shot.timeline_end - shot.timeline_start))
+            clip = VideoFileClip(str(shot.source_path))
+            opened_video_clips.append(clip)
+
+            if clip.duration <= 0:
+                continue
+
+            if clip.duration < needed:
+                repeats = int(needed // clip.duration) + 1
+                extended = concatenate_videoclips([clip] * repeats).subclip(0, needed)
+            else:
+                extended = clip.subclip(0, needed)
+
+            fitted = _fit_clip_to_canvas(extended, width=width, height=height)
+            assembled.append(fitted)
+
+        if not assembled:
+            raise ValueError("Failed to assemble output timeline.")
+
+        final_video = concatenate_videoclips(assembled, method="compose")
+
+        voiceover_clip = AudioFileClip(str(voiceover_path))
+        final_duration = min(float(final_video.duration), float(voiceover_clip.duration))
+        log(f"Voiceover duration: {voiceover_clip.duration:.2f}s | Final duration: {final_duration:.2f}s")
+        final_video = final_video.subclip(0, final_duration)
+        voiceover_clip = voiceover_clip.subclip(0, final_duration)
+
+        subtitle_clips = _subtitle_overlays(
+            subtitle_plan=subtitle_plan,
+            width=width,
+            height=height,
+            final_duration=final_duration,
+        )
+        log(f"Caption segments burned in: {len(subtitle_clips)}")
+        if subtitle_clips:
+            final_video = CompositeVideoClip([final_video, *subtitle_clips], size=(width, height))
+
+        tracks = [voiceover_clip.volumex(1.0)]
+        music_track = _pick_music_track(music_folder)
+        if music_track:
+            log(f"Selected music track: {music_track.name}")
+            music_clip = AudioFileClip(str(music_track))
+            music_clip = audio_loop(music_clip, duration=final_video.duration).volumex(0.15)
+            tracks.append(music_clip)
+
+        if len(tracks) == 1:
+            final_audio = tracks[0].set_duration(final_duration)
+        else:
+            final_audio = CompositeAudioClip(tracks).set_duration(final_duration)
+        final_video = final_video.without_audio().set_audio(final_audio)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        preset = render_preset if render_preset in {"veryfast", "medium", "slow"} else "veryfast"
+        thread_count = max(1, (os.cpu_count() or 4) - 1)
+        log(f"Rendering MP4 with preset={preset}, threads={thread_count}")
+        final_video.write_videofile(
+            str(output_path),
+            codec="libx264",
+            audio_codec="aac",
+            audio=True,
+            temp_audiofile=str(output_path.with_suffix(".temp-audio.m4a")),
+            remove_temp=True,
+            fps=fps,
+            preset=preset,
+            threads=thread_count,
+        )
+        log(f"Export complete: {output_path}")
+    finally:
+        if final_video is not None:
+            final_video.close()
+        if voiceover_clip is not None:
+            voiceover_clip.close()
+        if music_clip is not None:
+            music_clip.close()
+        for c in subtitle_clips:
+            c.close()
+        for c in opened_video_clips:
+            c.close()

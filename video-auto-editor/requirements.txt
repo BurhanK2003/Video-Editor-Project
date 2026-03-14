@@ -1,0 +1,4 @@
+moviepy==1.0.3
+pydub==0.25.1
+imageio-ffmpeg==0.6.0
+
