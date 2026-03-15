@@ -19,6 +19,9 @@ TRANSITION_STYLES = ("none", "crossfade", "zoom", "fade_black")
 SEGMENT_TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+MICRO_ZOOM_EVERY_SECONDS = 2.35
+MICRO_ZOOM_PULSE_SECONDS = 0.46
+MICRO_ZOOM_STRENGTH = 0.055
 
 
 def _fit_clip_to_canvas(clip: VideoFileClip, width: int, height: int) -> VideoFileClip:
@@ -32,6 +35,31 @@ def _fit_clip_to_canvas(clip: VideoFileClip, width: int, height: int) -> VideoFi
         resized = clip.resize(width=width)
 
     return resized.crop(x_center=resized.w / 2, y_center=resized.h / 2, width=width, height=height)
+
+
+def _apply_micro_zooms(
+    clip: VideoFileClip,
+    pulse_every: float = MICRO_ZOOM_EVERY_SECONDS,
+    pulse_seconds: float = MICRO_ZOOM_PULSE_SECONDS,
+    strength: float = MICRO_ZOOM_STRENGTH,
+) -> VideoFileClip:
+    """Apply periodic micro-zoom pulses to keep visuals feeling active.
+
+    Pulses are subtle and brief to avoid seasickness while still improving retention.
+    """
+    cycle = max(1.6, float(pulse_every))
+    width, height = clip.w, clip.h
+
+    def scale_at_time(t: float) -> float:
+        phase = float(t) % cycle
+        if phase > pulse_seconds:
+            return 1.0
+        pulse_pos = phase / max(0.05, pulse_seconds)
+        envelope = math.sin(math.pi * pulse_pos)
+        return 1.0 + max(0.0, float(strength)) * envelope
+
+    animated = clip.resize(lambda t: scale_at_time(t))
+    return animated.crop(x_center=animated.w / 2, y_center=animated.h / 2, width=width, height=height)
 
 
 def _pick_music_track(music_folder: Path | None) -> Path | None:
@@ -493,6 +521,12 @@ def render_video(
             size=(width, height),
         )
         log(f"Transitions applied: {transition_count}")
+
+        final_video = _apply_micro_zooms(final_video)
+        log(
+            f"Micro-zooms enabled: every {MICRO_ZOOM_EVERY_SECONDS:.2f}s "
+            f"(pulse {MICRO_ZOOM_PULSE_SECONDS:.2f}s, strength {MICRO_ZOOM_STRENGTH:.3f})"
+        )
 
         voice_duration = float(voiceover_clip.duration)
         if float(final_video.duration) < voice_duration:
