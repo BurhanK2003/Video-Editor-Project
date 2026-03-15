@@ -50,4 +50,6 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
         render_preset=request.render_preset,
         music_folder=request.music_folder,
         log=log,
+        transition_style=request.transition_style,
+        transition_duration=request.transition_duration,
     )

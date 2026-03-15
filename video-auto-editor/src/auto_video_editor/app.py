@@ -15,6 +15,13 @@ RENDER_SPEED_PRESETS = {
     "Quality": "slow",
 }
 
+TRANSITION_STYLE_MAP = {
+    "None": "none",
+    "Crossfade": "crossfade",
+    "Zoom": "zoom",
+    "Fade Black": "fade_black",
+}
+
 
 class AutoEditorApp:
     def __init__(self, root: tk.Tk):
@@ -34,6 +41,8 @@ class AutoEditorApp:
         self.fps_var = tk.IntVar(value=24)
         self.render_speed_var = tk.StringVar(value="Fast")
         self.allow_stock_fetch_var = tk.BooleanVar(value=True)
+        self.transition_style_var = tk.StringVar(value="Crossfade")
+        self.transition_duration_var = tk.DoubleVar(value=0.22)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -107,6 +116,26 @@ class AutoEditorApp:
             text="Fetch stock clips from Pexels/Pixabay if local clips are missing",
             variable=self.allow_stock_fetch_var,
         ).grid(row=2, column=0, columnspan=6, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Label(settings, text="Transition").grid(row=3, column=0, padx=8, pady=6, sticky="w")
+        ttk.Combobox(
+            settings,
+            textvariable=self.transition_style_var,
+            values=["None", "Crossfade", "Zoom", "Fade Black"],
+            state="readonly",
+            width=12,
+        ).grid(row=3, column=1, padx=8, pady=6, sticky="w")
+
+        ttk.Label(settings, text="Trans. Dur (s)").grid(row=3, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            settings,
+            from_=0.1,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.transition_duration_var,
+            width=8,
+            format="%.1f",
+        ).grid(row=3, column=3, padx=8, pady=6, sticky="w")
 
         self.run_button = ttk.Button(frame, text="Auto Edit", command=self._start_auto_edit)
         self.run_button.pack(fill="x", pady=(8, 10))
@@ -217,6 +246,8 @@ class AutoEditorApp:
             render_preset=RENDER_SPEED_PRESETS.get(self.render_speed_var.get(), "veryfast"),
             allow_stock_fetch=self.allow_stock_fetch_var.get(),
             stock_keywords=self.stock_keywords_var.get().strip(),
+            transition_style=TRANSITION_STYLE_MAP.get(self.transition_style_var.get(), "crossfade"),
+            transition_duration=float(self.transition_duration_var.get()),
         )
 
     def _start_auto_edit(self) -> None:

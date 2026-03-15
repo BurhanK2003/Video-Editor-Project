@@ -107,12 +107,16 @@ def _build_queries(plan: list[PlannedSegment], keywords_override: str) -> list[s
         )
 
     derived = []
+    for segment in plan[:14]:
+        if segment.visual_query.strip():
+            derived.append(segment.visual_query.strip())
+
     for segment in plan[:10]:
         keywords = suggest_scene_keywords(segment.text, max_keywords=3)
         if keywords:
-            derived.append(" ".join(keywords))
+            derived.append(f"cinematic {' '.join(keywords)} 4k")
 
-    return _dedupe(derived + DEFAULT_QUERIES)
+    return _dedupe(derived + ["cinematic nature 4k", *DEFAULT_QUERIES])
 
 
 def _download_from_pexels(

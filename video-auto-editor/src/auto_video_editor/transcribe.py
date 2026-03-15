@@ -4,7 +4,7 @@ from pathlib import Path
 
 from moviepy.editor import AudioFileClip
 
-from .models import TranscriptSegment
+from .models import TranscriptSegment, WordToken
 
 
 def _audio_duration_seconds(audio_path: Path) -> float:
@@ -33,12 +33,23 @@ def transcribe_voiceover(
             str(voiceover_path),
             beam_size=3,
             vad_filter=True,
+            word_timestamps=True,
         )
         segments = [
             TranscriptSegment(
                 start=float(seg.start),
                 end=float(seg.end),
                 text=(seg.text or "").strip(),
+                words=[
+                    WordToken(
+                        start=float(w.start),
+                        end=float(w.end),
+                        text=(w.word or "").strip(),
+                    )
+                    for w in (seg.words or [])
+                    if (w.word or "").strip()
+                ]
+                or None,
             )
             for seg in raw_segments
             if (seg.text or "").strip()

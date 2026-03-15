@@ -71,7 +71,30 @@ def suggest_scene_keywords(text: str, max_keywords: int = 4) -> list[str]:
 
 def _scene_query(text: str) -> str:
     keywords = suggest_scene_keywords(text, max_keywords=3)
-    return " ".join(keywords)
+    query = " ".join(keywords)
+    if "nature lives in you" in text.lower():
+        # Reinforce stock search / matching toward nature-first visuals.
+        query = f"nature forest life wellness {query}".strip()
+    return query
+
+
+def _movement_score(clip_text: str) -> float:
+    movement_terms = {
+        "running",
+        "walking",
+        "flying",
+        "waves",
+        "action",
+        "dynamic",
+        "motion",
+        "drone",
+        "timelapse",
+        "closeup",
+        "close-up",
+    }
+    tokens = _tokenize(clip_text)
+    hits = len(tokens.intersection(movement_terms))
+    return min(0.35, hits * 0.08)
 
 
 def _clip_metadata_text(clip_path: Path) -> str:
@@ -168,12 +191,69 @@ def list_video_clips(clips_folder: Path | None) -> list[Path]:
     return clips
 
 
+def _build_visual_plan(plan: list[PlannedSegment]) -> list[PlannedSegment]:
+    if not plan:
+        return []
+
+    visual: list[PlannedSegment] = []
+    idx = 0
+    while idx < len(plan):
+        first = plan[idx]
+        target_len = max(1.0, min(float(first.clip_length_seconds), 3.0))
+        start = float(first.start)
+        end = float(first.end)
+        collected_text = [first.text]
+        transition_after = first.transition_after
+        transition_seconds = first.transition_seconds
+        transition_type = first.transition_type
+        emotion = first.emotion
+        visual_query = first.visual_query
+
+        j = idx + 1
+        while j < len(plan) and (end - start) < target_len:
+            nxt = plan[j]
+            end = max(end, float(nxt.end))
+            collected_text.append(nxt.text)
+            transition_after = nxt.transition_after
+            transition_seconds = nxt.transition_seconds
+            transition_type = nxt.transition_type
+            if not visual_query and nxt.visual_query:
+                visual_query = nxt.visual_query
+            j += 1
+
+        visual.append(
+            PlannedSegment(
+                start=start,
+                end=end,
+                text=" ".join(collected_text).strip(),
+                duration=max(0.5, end - start),
+                transition_after=transition_after,
+                transition_seconds=transition_seconds,
+                emphasis=first.emphasis,
+                highlight_phrase=first.highlight_phrase,
+                emphasis_words=first.emphasis_words,
+                visual_query=visual_query,
+                emotion=emotion,
+                pacing=first.pacing,
+                transition_type=transition_type,
+                clip_length_seconds=target_len,
+            )
+        )
+        idx = j
+
+    return visual
+
+
 def assign_clips(
     plan: list[PlannedSegment],
     clip_paths: list[Path],
     log: callable | None = None,
 ) -> list[TimelineClip]:
     if not plan or not clip_paths:
+        return []
+
+    visual_plan = _build_visual_plan(plan)
+    if not visual_plan:
         return []
 
     clip_descriptions = [_clip_description(path) for path in clip_paths]
@@ -184,13 +264,15 @@ def assign_clips(
     recent_indices: list[int] = []
     cursor = 0.0
 
-    for scene_idx, segment in enumerate(plan, start=1):
+    for scene_idx, segment in enumerate(visual_plan, start=1):
         scene_text = (segment.text or "").strip() or "voiceover"
-        scene_query = _scene_query(scene_text)
+        scene_query = (segment.visual_query or "").strip() or _scene_query(scene_text)
         if embedder is not None:
             scores = _semantic_scores(embedder, scene_query, clip_descriptions)
         else:
             scores = [_lexical_similarity(scene_query, clip_text) for clip_text in clip_descriptions]
+
+        scores = [base + _movement_score(desc) for base, desc in zip(scores, clip_descriptions)]
 
         chosen_idx = _select_best_index(scores, usage_count, recent_indices)
         clip_path = clip_paths[chosen_idx]
@@ -201,7 +283,7 @@ def assign_clips(
             keywords = suggest_scene_keywords(scene_text)
             log(
                 f"Scene {scene_idx}: keywords={', '.join(keywords)} | "
-                f"query='{scene_query}' | chosen={clip_path.name}"
+                f"query='{scene_query}' | emotion={segment.emotion} | chosen={clip_path.name}"
             )
 
         end = cursor + segment.duration
@@ -210,6 +292,10 @@ def assign_clips(
                 source_path=clip_path,
                 timeline_start=cursor,
                 timeline_end=end,
+                transition_after=segment.transition_after,
+                transition_seconds=segment.transition_seconds,
+                transition_type=segment.transition_type,
+                emotion=segment.emotion,
             )
         )
         cursor = end

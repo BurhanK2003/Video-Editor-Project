@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import math
 import os
 import random
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from moviepy.audio.AudioClip import AudioClip
 from moviepy.audio.AudioClip import CompositeAudioClip
+from moviepy.audio.AudioClip import concatenate_audioclips
 from moviepy.audio.fx.all import audio_loop
 from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoFileClip, concatenate_videoclips
 
 from .models import PlannedSegment, TimelineClip
+
+TRANSITION_STYLES = ("none", "crossfade", "zoom", "fade_black")
+SEGMENT_TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
@@ -71,6 +77,274 @@ def _load_caption_font(height: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _load_caption_font_bold(height: int) -> ImageFont.ImageFont:
+    size = max(30, int(height * 0.032))
+    for name in ("arialbd.ttf", "segoeuib.ttf", "calibrib.ttf"):
+        try:
+            return ImageFont.truetype(name, size=size)
+        except Exception:
+            continue
+    return _load_caption_font(height)
+
+
+def _apply_ken_burns(clip: VideoFileClip, zoom_ratio: float = 0.06) -> VideoFileClip:
+    """Slowly zoom into the clip over its duration (Ken Burns effect).
+
+    The clip is centre-cropped so the output dimensions never change.
+    *zoom_ratio* is the fractional size increase at the end (0.06 = 6%).
+    """
+    w, h = clip.w, clip.h
+
+    def zoom_frame(gf, t: float):
+        progress = min(t / max(clip.duration, 1e-3), 1.0)
+        scale = 1.0 + zoom_ratio * progress
+        frame = gf(t)
+        new_w = max(w, int(w * scale))
+        new_h = max(h, int(h * scale))
+        resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
+        arr = np.array(resized)
+        y0 = (new_h - h) // 2
+        x0 = (new_w - w) // 2
+        return arr[y0 : y0 + h, x0 : x0 + w]
+
+    return clip.fl(zoom_frame)
+
+
+def _build_trimmed_voiceover(
+    voiceover_path: Path,
+    subtitle_plan: list[PlannedSegment],
+    log: callable,
+) -> tuple[AudioClip, list[PlannedSegment]]:
+    """Trim long pauses between transcript segments and remap subtitle times."""
+    source = AudioFileClip(str(voiceover_path))
+    if not subtitle_plan:
+        return source, subtitle_plan
+
+    sorted_plan = sorted(subtitle_plan, key=lambda s: float(s.start))
+    audio_parts: list[AudioClip] = []
+    remapped: list[PlannedSegment] = []
+
+    max_gap_keep = 0.22
+    cursor = 0.0
+    prev_end = 0.0
+    trimmed_gap_total = 0.0
+
+    for seg in sorted_plan:
+        seg_start = max(prev_end, float(seg.start))
+        seg_end = min(float(seg.end), float(source.duration))
+        if seg_end <= seg_start:
+            continue
+
+        gap = max(0.0, seg_start - prev_end)
+        keep_gap = min(gap, max_gap_keep)
+        if keep_gap > 0.0:
+            audio_parts.append(source.subclip(prev_end, prev_end + keep_gap))
+            cursor += keep_gap
+        trimmed_gap_total += max(0.0, gap - keep_gap)
+
+        part = source.subclip(seg_start, seg_end)
+        audio_parts.append(part)
+
+        new_start = cursor
+        new_end = new_start + (seg_end - seg_start)
+        remapped.append(
+            PlannedSegment(
+                start=new_start,
+                end=new_end,
+                text=seg.text,
+                duration=max(0.45, new_end - new_start),
+                transition_after=seg.transition_after,
+                transition_seconds=seg.transition_seconds,
+                emphasis=seg.emphasis,
+                highlight_phrase=seg.highlight_phrase,
+                emphasis_words=seg.emphasis_words,
+                visual_query=seg.visual_query,
+                emotion=seg.emotion,
+                pacing=seg.pacing,
+                transition_type=seg.transition_type,
+                clip_length_seconds=seg.clip_length_seconds,
+            )
+        )
+        cursor = new_end
+        prev_end = seg_end
+
+    # Keep a tiny tail so the final spoken word does not sound clipped.
+    tail = min(0.12, max(0.0, float(source.duration) - prev_end))
+    if tail > 0:
+        audio_parts.append(source.subclip(prev_end, prev_end + tail))
+
+    if not audio_parts:
+        return source, subtitle_plan
+
+    trimmed_audio = concatenate_audioclips(audio_parts)
+    log(f"Trimmed silence between sentences: {trimmed_gap_total:.2f}s removed")
+    # Do not close `source` here; concatenated subclips still read frames from it.
+    return trimmed_audio, remapped
+
+
+def _compose_with_adaptive_transitions(
+    clips: list[VideoFileClip],
+    transition_plan: list[TimelineClip],
+    style: str,
+    default_dur: float,
+    size: tuple[int, int],
+) -> tuple[CompositeVideoClip, int]:
+    """Build a timeline with per-cut transition decisions from the plan."""
+    if not clips:
+        raise ValueError("No clips to compose")
+
+    if style not in TRANSITION_STYLES:
+        style = "crossfade"
+
+    prepared = clips
+    if style == "zoom":
+        prepared = [_apply_ken_burns(c) for c in clips]
+
+    timeline: list[VideoFileClip] = []
+    cursor = 0.0
+    applied = 0
+
+    for i, clip in enumerate(prepared):
+        start = cursor
+        transition_enabled = False
+        trans_dur = max(0.1, min(float(default_dur), 0.8))
+
+        if i > 0:
+            prev = transition_plan[i - 1] if i - 1 < len(transition_plan) else None
+            if prev is not None:
+                transition_enabled = bool(prev.transition_after) and style != "none"
+                trans_dur = max(0.1, min(float(prev.transition_seconds), 0.8))
+                transition_kind = prev.transition_type if prev.transition_type in SEGMENT_TRANSITIONS else "jump_cut"
+            else:
+                transition_kind = "jump_cut"
+        else:
+            transition_kind = "jump_cut"
+
+        if transition_enabled:
+            if transition_kind == "jump_cut":
+                pass
+            elif transition_kind == "zoom_in":
+                clip = _apply_ken_burns(clip, zoom_ratio=0.09).crossfadein(max(0.10, trans_dur))
+                start = max(0.0, cursor - max(0.10, trans_dur))
+                applied += 1
+            elif transition_kind == "whip":
+                whip_dur = max(0.08, min(trans_dur, 0.16))
+                clip = clip.resize(lambda t: 1.03 + 0.05 * math.exp(-16.0 * t)).crossfadein(whip_dur)
+                start = max(0.0, cursor - whip_dur)
+                applied += 1
+            elif transition_kind == "fade":
+                fade_dur = max(0.10, trans_dur)
+                clip = clip.fadein(fade_dur)
+                if timeline:
+                    timeline[-1] = timeline[-1].fadeout(fade_dur)
+                applied += 1
+
+        timeline.append(clip.set_start(start))
+        cursor = max(cursor, start + clip.duration)
+
+    return CompositeVideoClip(timeline, size=size).set_duration(cursor), applied
+
+
+def _window_energy(clip: AudioClip, center: float, window: float = 0.16, samples: int = 11) -> float:
+    """Estimate speech intensity around a timestamp using RMS energy."""
+    if clip is None or not hasattr(clip, "get_frame"):
+        return 0.0
+    if clip.duration <= 0:
+        return 0.0
+
+    half = window / 2.0
+    start = max(0.0, center - half)
+    end = min(float(clip.duration), center + half)
+    if end <= start:
+        return 0.0
+
+    energies: list[float] = []
+    for i in range(samples):
+        t = start + (end - start) * (i / max(1, samples - 1))
+        try:
+            frame = np.array(clip.get_frame(t), dtype=np.float32)
+        except Exception:
+            return 0.0
+        if frame.ndim > 0:
+            frame = np.mean(frame)
+        val = float(abs(frame))
+        energies.append(val * val)
+    return math.sqrt(float(np.mean(energies))) if energies else 0.0
+
+
+def _sync_plan_to_voice_energy(
+    subtitle_plan: list[PlannedSegment],
+    voiceover_clip: AudioClip,
+    log: callable,
+) -> list[PlannedSegment]:
+    """Beat-sync transitions and emphasis from measured voice intensity."""
+    if not subtitle_plan:
+        return subtitle_plan
+
+    seg_energy: list[float] = []
+    boundary_energy: list[float] = []
+
+    for idx, seg in enumerate(subtitle_plan):
+        center = (float(seg.start) + float(seg.end)) / 2.0
+        seg_energy.append(_window_energy(voiceover_clip, center=center, window=0.20, samples=13))
+        if idx < len(subtitle_plan) - 1:
+            boundary_t = float(seg.end)
+            boundary_energy.append(_window_energy(voiceover_clip, center=boundary_t, window=0.14, samples=9))
+
+    baseline = max(1e-4, float(np.median(seg_energy)) if seg_energy else 1e-4)
+
+    updated: list[PlannedSegment] = []
+    forced_emphasis = 0
+    transitions_disabled = 0
+
+    for idx, seg in enumerate(subtitle_plan):
+        local_energy = seg_energy[idx] if idx < len(seg_energy) else baseline
+        energy_ratio = local_energy / baseline
+
+        emphasis = seg.emphasis or energy_ratio >= 1.28
+        if emphasis and not seg.emphasis:
+            forced_emphasis += 1
+
+        transition_after = seg.transition_after
+        transition_seconds = max(0.10, min(float(seg.transition_seconds), 0.80))
+        if idx < len(boundary_energy):
+            b_ratio = boundary_energy[idx] / baseline
+            if b_ratio < 0.70:
+                transition_after = False
+                transitions_disabled += 1
+            elif b_ratio >= 1.35:
+                transition_after = True
+                transition_seconds = max(0.10, transition_seconds * 0.72)
+            elif b_ratio >= 1.10:
+                transition_seconds = max(0.10, transition_seconds * 0.85)
+
+        updated.append(
+            PlannedSegment(
+                start=seg.start,
+                end=seg.end,
+                text=seg.text,
+                duration=seg.duration,
+                transition_after=transition_after,
+                transition_seconds=transition_seconds,
+                emphasis=emphasis,
+                highlight_phrase=seg.highlight_phrase,
+                emphasis_words=seg.emphasis_words,
+                visual_query=seg.visual_query,
+                emotion=seg.emotion,
+                pacing=seg.pacing,
+                transition_type=seg.transition_type,
+                clip_length_seconds=seg.clip_length_seconds,
+            )
+        )
+
+    log(
+        "Beat sync: "
+        f"{forced_emphasis} extra emphasis points, "
+        f"{transitions_disabled} low-energy cuts switched to hard cuts"
+    )
+    return updated
+
+
 def _subtitle_overlays(
     subtitle_plan: list[PlannedSegment],
     width: int,
@@ -95,7 +369,7 @@ def _subtitle_overlays(
 
         image = Image.new("RGBA", (width, box_height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        font = _load_caption_font(height)
+        font = _load_caption_font_bold(height) if segment.emphasis else _load_caption_font(height)
 
         wrapped = _wrap_text(draw, text, font, max_text_width)
         if not wrapped:
@@ -120,26 +394,27 @@ def _subtitle_overlays(
             radius=14,
             fill=(0, 0, 0, 90),
         )
-        draw.rounded_rectangle(
-            (rect_x0, rect_y0, rect_x1, rect_y1),
-            radius=14,
-            fill=(20, 20, 20, 190),
-        )
+        base_fill = (20, 20, 20, 190)
+        if segment.emphasis:
+            base_fill = (30, 24, 10, 208)
+        draw.rounded_rectangle((rect_x0, rect_y0, rect_x1, rect_y1), radius=14, fill=base_fill)
 
         accent_h = max(6, int(rect_h * 0.12))
-        draw.rounded_rectangle(
-            (rect_x0, rect_y0, rect_x1, rect_y0 + accent_h),
-            radius=14,
-            fill=(255, 196, 0, 220),
-        )
+        accent_color = (255, 196, 0, 220) if not segment.emphasis else (255, 223, 92, 235)
+        draw.rounded_rectangle((rect_x0, rect_y0, rect_x1, rect_y0 + accent_h), radius=14, fill=accent_color)
 
         text_x = (width - text_w) // 2
         text_y = (box_height - text_h) // 2
+        text_fill = (255, 255, 255, 255)
+        if segment.highlight_phrase:
+            wrapped = wrapped.replace(segment.highlight_phrase, segment.highlight_phrase.upper())
+            text_fill = (255, 244, 179, 255)
+
         draw.multiline_text(
             (text_x, text_y),
             wrapped,
             font=font,
-            fill=(255, 255, 255, 255),
+            fill=text_fill,
             stroke_width=2,
             stroke_fill=(0, 0, 0, 230),
             align="center",
@@ -153,6 +428,9 @@ def _subtitle_overlays(
             .set_end(end)
             .set_position(("center", int(height * 0.60)))
         )
+        clip = clip.crossfadein(0.12).crossfadeout(0.10)
+        if segment.emphasis:
+            clip = clip.resize(lambda t: 1.0 + 0.05 * math.exp(-8.0 * t))
         overlays.append(clip)
 
     return overlays
@@ -169,6 +447,8 @@ def render_video(
     render_preset: str,
     music_folder: Path | None,
     log: callable,
+    transition_style: str = "crossfade",
+    transition_duration: float = 0.4,
 ) -> None:
     if not timeline_clips:
         raise ValueError("No timeline clips available. Add clips in the clips folder.")
@@ -176,7 +456,7 @@ def render_video(
     assembled = []
     opened_video_clips: list[VideoFileClip] = []
     subtitle_clips: list[ImageClip] = []
-    voiceover_clip: AudioFileClip | None = None
+    voiceover_clip: AudioClip | None = None
     music_clip: AudioFileClip | None = None
     final_video = None
 
@@ -201,13 +481,29 @@ def render_video(
         if not assembled:
             raise ValueError("Failed to assemble output timeline.")
 
-        final_video = concatenate_videoclips(assembled, method="compose")
+        voiceover_clip, subtitle_plan = _build_trimmed_voiceover(voiceover_path, subtitle_plan, log)
+        subtitle_plan = _sync_plan_to_voice_energy(subtitle_plan, voiceover_clip, log)
 
-        voiceover_clip = AudioFileClip(str(voiceover_path))
-        final_duration = min(float(final_video.duration), float(voiceover_clip.duration))
-        log(f"Voiceover duration: {voiceover_clip.duration:.2f}s | Final duration: {final_duration:.2f}s")
+        log(f"Applying adaptive '{transition_style}' transitions")
+        final_video, transition_count = _compose_with_adaptive_transitions(
+            clips=assembled,
+            transition_plan=timeline_clips,
+            style=transition_style,
+            default_dur=transition_duration,
+            size=(width, height),
+        )
+        log(f"Transitions applied: {transition_count}")
+
+        voice_duration = float(voiceover_clip.duration)
+        if float(final_video.duration) < voice_duration:
+            # Prevent voice truncation by freezing the last frame as needed.
+            missing = voice_duration - float(final_video.duration)
+            hold = final_video.to_ImageClip(t=max(0.0, float(final_video.duration) - 0.05)).set_duration(missing)
+            final_video = concatenate_videoclips([final_video, hold], method="compose")
+
+        final_duration = voice_duration
+        log(f"Voiceover duration: {voice_duration:.2f}s | Final duration: {final_duration:.2f}s")
         final_video = final_video.subclip(0, final_duration)
-        voiceover_clip = voiceover_clip.subclip(0, final_duration)
 
         subtitle_clips = _subtitle_overlays(
             subtitle_plan=subtitle_plan,
@@ -224,7 +520,7 @@ def render_video(
         if music_track:
             log(f"Selected music track: {music_track.name}")
             music_clip = AudioFileClip(str(music_track))
-            music_clip = audio_loop(music_clip, duration=final_video.duration).volumex(0.15)
+            music_clip = audio_loop(music_clip, duration=final_duration).volumex(0.15)
             tracks.append(music_clip)
 
         if len(tracks) == 1:
