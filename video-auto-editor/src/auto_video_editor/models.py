@@ -61,7 +61,7 @@ class AutoEditRequest:
     render_preset: str = "veryfast"
     allow_stock_fetch: bool = True
     stock_keywords: str = ""
-    transition_style: str = "crossfade"  # none | crossfade | zoom | fade_black
+    transition_style: str = "pro_weighted"  # none | pro_weighted
     transition_duration: float = 0.22
     caption_style: str = "beast"
     caption_position_ratio: float | None = None

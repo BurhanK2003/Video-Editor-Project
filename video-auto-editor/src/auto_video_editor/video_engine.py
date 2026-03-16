@@ -6,6 +6,7 @@ from typing import Any
 from .matcher import assign_clips
 from .planner import build_plan
 from .renderer import render_video
+from .rhythm import apply_rhythm_sync, resolve_music_track
 from .transcribe import transcribe_voiceover
 
 
@@ -54,6 +55,13 @@ class VideoEngine:
         segments = transcribe_voiceover(voiceover_path=voiceover, model_size=model_size, log=self._log)
         plan = build_plan(segments)
         timeline = assign_clips(plan, available_clips, log=self._log)
+        selected_music_track = resolve_music_track(Path(music_path) if music_path else None)
+        timeline = apply_rhythm_sync(
+            timeline=timeline,
+            voiceover_path=voiceover,
+            music_path=selected_music_track,
+            log=self._log,
+        )
 
         render_video(
             timeline_clips=timeline,
@@ -64,9 +72,9 @@ class VideoEngine:
             height=int(config.get("height", 1920)),
             fps=int(config.get("fps", 24)),
             render_preset=str(config.get("render_preset", "veryfast")),
-            music_folder=(Path(music_path) if music_path else None),
+            music_folder=selected_music_track,
             log=self._log,
-            transition_style=str(config.get("transition_style", "crossfade")),
+            transition_style=str(config.get("transition_style", "pro_weighted")),
             transition_duration=float(config.get("transition_duration", 0.22)),
             caption_style=str(config.get("caption_style", "bold_stroke")),
             caption_position_ratio=config.get("caption_position_ratio"),

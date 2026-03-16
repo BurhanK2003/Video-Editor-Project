@@ -4,4 +4,5 @@ numpy==2.4.3
 pydub==0.25.1
 imageio-ffmpeg==0.6.0
 faster-whisper==1.1.1
+librosa==0.11.0
 

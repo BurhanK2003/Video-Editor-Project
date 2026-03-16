@@ -17,9 +17,7 @@ RENDER_SPEED_PRESETS = {
 
 TRANSITION_STYLE_MAP = {
     "None": "none",
-    "Crossfade": "crossfade",
-    "Zoom": "zoom",
-    "Fade Black": "fade_black",
+    "Professional Weighted": "pro_weighted",
 }
 
 CAPTION_STYLE_MAP = {
@@ -47,7 +45,7 @@ class AutoEditorApp:
         self.fps_var = tk.IntVar(value=24)
         self.render_speed_var = tk.StringVar(value="Fast")
         self.allow_stock_fetch_var = tk.BooleanVar(value=True)
-        self.transition_style_var = tk.StringVar(value="Crossfade")
+        self.transition_style_var = tk.StringVar(value="Professional Weighted")
         self.transition_duration_var = tk.DoubleVar(value=0.22)
         self.caption_style_var = tk.StringVar(value="Bold Stroke")
         self.whisper_model_var = tk.StringVar(value="base")
@@ -135,39 +133,39 @@ class AutoEditorApp:
         ttk.Combobox(
             settings,
             textvariable=self.transition_style_var,
-            values=["None", "Crossfade", "Zoom", "Fade Black"],
+            values=list(TRANSITION_STYLE_MAP.keys()),
             state="readonly",
-            width=12,
+            width=22,
         ).grid(row=3, column=1, padx=8, pady=6, sticky="w")
 
-        ttk.Label(settings, text="Trans. Dur (s)").grid(row=3, column=2, padx=8, pady=6, sticky="w")
-        ttk.Spinbox(
-            settings,
-            from_=0.1,
-            to=2.0,
-            increment=0.1,
-            textvariable=self.transition_duration_var,
-            width=8,
-            format="%.1f",
-        ).grid(row=3, column=3, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="Engine").grid(row=3, column=2, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="35/25/20/10/10 weighted cut mix").grid(
+            row=3, column=3, columnspan=3, padx=8, pady=6, sticky="w"
+        )
 
-        ttk.Label(settings, text="Captions").grid(row=4, column=0, padx=8, pady=6, sticky="w")
+        ttk.Label(
+            settings,
+            text="zoom punch 6f | smash 1f | whip 4f | glitch 3f | fade 2-4f",
+            foreground="grey",
+        ).grid(row=4, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w")
+
+        ttk.Label(settings, text="Captions").grid(row=5, column=0, padx=8, pady=6, sticky="w")
         ttk.Combobox(
             settings,
             textvariable=self.caption_style_var,
             values=list(CAPTION_STYLE_MAP.keys()),
             state="readonly",
             width=12,
-        ).grid(row=4, column=1, padx=8, pady=6, sticky="w")
+        ).grid(row=5, column=1, padx=8, pady=6, sticky="w")
 
-        ttk.Label(settings, text="Whisper").grid(row=4, column=2, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="Whisper").grid(row=5, column=2, padx=8, pady=6, sticky="w")
         ttk.Combobox(
             settings,
             textvariable=self.whisper_model_var,
             values=["tiny", "base", "small", "medium", "large"],
             state="readonly",
             width=10,
-        ).grid(row=4, column=3, padx=8, pady=6, sticky="w")
+        ).grid(row=5, column=3, padx=8, pady=6, sticky="w")
 
         subtitle_style = ttk.LabelFrame(frame, text="Subtitle Styling Editor", padding=8)
         subtitle_style.pack(fill="x", pady=(0, 8))

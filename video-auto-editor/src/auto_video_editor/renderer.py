@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import random
@@ -16,8 +17,15 @@ from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoCl
 
 from .models import PlannedSegment, TimelineClip, WordToken
 
-TRANSITION_STYLES = ("none", "crossfade", "zoom", "fade_black")
+TRANSITION_STYLES = ("none", "pro_weighted")
 SEGMENT_TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
+PRO_TRANSITION_WEIGHTS = (
+    ("zoom_punch", 0.35),
+    ("smash_cut", 0.25),
+    ("whip_pan", 0.20),
+    ("glitch_cut", 0.10),
+    ("fade_black", 0.10),
+)
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -153,6 +161,8 @@ def _apply_micro_zooms(
 def _pick_music_track(music_folder: Path | None) -> Path | None:
     if not music_folder or not music_folder.exists():
         return None
+    if music_folder.is_file() and music_folder.suffix.lower() in AUDIO_EXTENSIONS:
+        return music_folder
     tracks = [
         p
         for p in sorted(music_folder.rglob("*"))
@@ -337,67 +347,249 @@ def _build_trimmed_voiceover(
     return trimmed_audio, remapped
 
 
+def _stable_transition_seed(transition_plan: list[TimelineClip]) -> int:
+    payload = "|".join(
+        f"{clip.source_path.as_posix()}:{float(clip.timeline_start):.3f}:{float(clip.timeline_end):.3f}:{clip.plan_idx}"
+        for clip in transition_plan
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
+def _build_weighted_transition_sequence(cut_count: int, rng: random.Random) -> list[str]:
+    if cut_count <= 0:
+        return []
+
+    counts: dict[str, int] = {}
+    remainders: list[tuple[float, float, str]] = []
+    assigned = 0
+    for name, weight in PRO_TRANSITION_WEIGHTS:
+        raw = cut_count * weight
+        whole = int(math.floor(raw))
+        counts[name] = whole
+        assigned += whole
+        remainders.append((raw - whole, weight, name))
+
+    remaining = max(0, cut_count - assigned)
+    remainders.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for idx in range(remaining):
+        counts[remainders[idx % len(remainders)][2]] += 1
+
+    sequence: list[str] = []
+    for name, _weight in PRO_TRANSITION_WEIGHTS:
+        sequence.extend([name] * counts.get(name, 0))
+
+    rng.shuffle(sequence)
+    return sequence
+
+
+def _center_crop_resize(frame: np.ndarray, scale: float) -> np.ndarray:
+    height, width = frame.shape[:2]
+    new_w = max(width, int(round(width * scale)))
+    new_h = max(height, int(round(height * scale)))
+    resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
+    arr = np.array(resized)
+    x0 = max(0, (new_w - width) // 2)
+    y0 = max(0, (new_h - height) // 2)
+    return arr[y0 : y0 + height, x0 : x0 + width]
+
+
+def _blend_with_color(frame: np.ndarray, color: tuple[int, int, int], alpha: float) -> np.ndarray:
+    clamped = max(0.0, min(1.0, float(alpha)))
+    target = np.empty_like(frame, dtype=np.float32)
+    target[..., 0] = color[0]
+    target[..., 1] = color[1]
+    target[..., 2] = color[2]
+    mixed = frame.astype(np.float32) * (1.0 - clamped) + target * clamped
+    return np.clip(mixed, 0, 255).astype(np.uint8)
+
+
+def _apply_rgb_split(frame: np.ndarray, offset: int) -> np.ndarray:
+    shifted = np.empty_like(frame)
+    shifted[..., 0] = np.roll(frame[..., 0], offset, axis=1)
+    shifted[..., 1] = frame[..., 1]
+    shifted[..., 2] = np.roll(frame[..., 2], -offset, axis=1)
+    shifted[::2, :, :] = np.clip(shifted[::2, :, :] * 0.92, 0, 255).astype(np.uint8)
+    return shifted
+
+
+def _apply_horizontal_motion_blur(frame: np.ndarray, offset: int) -> np.ndarray:
+    samples = [frame.astype(np.float32)]
+    for factor in (0.25, 0.5, 0.75, 1.0):
+        shift = int(round(offset * factor))
+        samples.append(np.roll(frame, shift, axis=1).astype(np.float32))
+        samples.append(np.roll(frame, -shift, axis=1).astype(np.float32))
+    return np.clip(np.mean(samples, axis=0), 0, 255).astype(np.uint8)
+
+
+def _apply_tail_frames(
+    clip: VideoClip,
+    fps: int,
+    frame_count: int,
+    transform,
+) -> VideoClip:
+    duration = float(clip.duration or 0.0)
+    if duration <= 0.0 or frame_count <= 0:
+        return clip
+
+    frame_count = max(1, int(frame_count))
+    window = min(duration, frame_count / max(1, int(fps)))
+    start_t = max(0.0, duration - window)
+
+    def _frame(gf, t: float):
+        frame = np.array(gf(t), copy=False)
+        if t < start_t:
+            return frame
+        local = max(0.0, t - start_t)
+        index = min(frame_count - 1, int(local * fps + 1e-6))
+        progress = (index + 1) / frame_count
+        return transform(frame, index, frame_count, progress)
+
+    return clip.fl(_frame, keep_duration=True)
+
+
+def _apply_head_frames(
+    clip: VideoClip,
+    fps: int,
+    frame_count: int,
+    transform,
+) -> VideoClip:
+    duration = float(clip.duration or 0.0)
+    if duration <= 0.0 or frame_count <= 0:
+        return clip
+
+    frame_count = max(1, int(frame_count))
+    window = min(duration, frame_count / max(1, int(fps)))
+
+    def _frame(gf, t: float):
+        frame = np.array(gf(t), copy=False)
+        if t >= window:
+            return frame
+        index = min(frame_count - 1, int(t * fps + 1e-6))
+        progress = (index + 1) / frame_count
+        return transform(frame, index, frame_count, progress)
+
+    return clip.fl(_frame, keep_duration=True)
+
+
+def _apply_zoom_punch_outgoing(clip: VideoClip, fps: int) -> VideoClip:
+    return _apply_tail_frames(
+        clip,
+        fps=fps,
+        frame_count=6,
+        transform=lambda frame, _idx, _total, progress: _center_crop_resize(frame, 1.0 + 0.20 * progress),
+    )
+
+
+def _apply_whip_pan_outgoing(clip: VideoClip, fps: int, direction: int) -> VideoClip:
+    return _apply_tail_frames(
+        clip,
+        fps=fps,
+        frame_count=4,
+        transform=lambda frame, _idx, _total, progress: _apply_horizontal_motion_blur(
+            frame,
+            max(8, int(round(frame.shape[1] * (0.015 + 0.03 * progress)))) * (1 if direction >= 0 else -1),
+        ),
+    )
+
+
+def _apply_smash_cut_incoming(clip: VideoClip, fps: int) -> VideoClip:
+    return _apply_head_frames(
+        clip,
+        fps=fps,
+        frame_count=1,
+        transform=lambda frame, _idx, _total, _progress: np.full_like(frame, 255, dtype=np.uint8),
+    )
+
+
+def _apply_glitch_cut_incoming(clip: VideoClip, fps: int, direction: int) -> VideoClip:
+    offsets = [20, 12, 6]
+    return _apply_head_frames(
+        clip,
+        fps=fps,
+        frame_count=3,
+        transform=lambda frame, idx, _total, _progress: _apply_rgb_split(
+            frame,
+            offsets[min(idx, len(offsets) - 1)] * (1 if direction >= 0 else -1),
+        ),
+    )
+
+
+def _apply_fade_black_pair(
+    outgoing: VideoClip,
+    incoming: VideoClip,
+    fps: int,
+    frame_count: int,
+) -> tuple[VideoClip, VideoClip]:
+    outgoing_fx = _apply_tail_frames(
+        outgoing,
+        fps=fps,
+        frame_count=frame_count,
+        transform=lambda frame, _idx, _total, progress: _blend_with_color(frame, (0, 0, 0), progress),
+    )
+    incoming_fx = _apply_head_frames(
+        incoming,
+        fps=fps,
+        frame_count=frame_count,
+        transform=lambda frame, _idx, _total, progress: _blend_with_color(frame, (0, 0, 0), 1.0 - progress),
+    )
+    return outgoing_fx, incoming_fx
+
+
 def _compose_with_adaptive_transitions(
-    clips: list[VideoFileClip],
+    clips: list[VideoClip],
     transition_plan: list[TimelineClip],
     style: str,
-    default_dur: float,
+    fps: int,
     size: tuple[int, int],
-) -> tuple[CompositeVideoClip, int]:
-    """Build a timeline with per-cut transition decisions from the plan."""
+) -> tuple[VideoClip, int, dict[str, int]]:
+    """Build a frame-accurate professional cut timeline from the plan."""
     if not clips:
         raise ValueError("No clips to compose")
 
     if style not in TRANSITION_STYLES:
-        style = "crossfade"
+        style = "pro_weighted"
 
-    prepared = clips
-    if style == "zoom":
-        prepared = [_apply_ken_burns(c) for c in clips]
+    prepared = list(clips)
+    if style == "none" or len(prepared) == 1:
+        return concatenate_videoclips(prepared, method="compose"), 0, {}
 
-    timeline: list[VideoFileClip] = []
-    cursor = 0.0
-    applied = 0
+    active_cut_indices = [
+        idx
+        for idx in range(len(prepared) - 1)
+        if idx < len(transition_plan) and bool(transition_plan[idx].transition_after)
+    ]
+    if not active_cut_indices:
+        return concatenate_videoclips(prepared, method="compose"), 0, {}
 
-    for i, clip in enumerate(prepared):
-        start = cursor
-        transition_enabled = False
-        trans_dur = max(0.1, min(float(default_dur), 0.8))
+    rng = random.Random(_stable_transition_seed(transition_plan))
+    sequence = _build_weighted_transition_sequence(len(active_cut_indices), rng)
+    counts: dict[str, int] = {name: 0 for name, _weight in PRO_TRANSITION_WEIGHTS}
 
-        if i > 0:
-            prev = transition_plan[i - 1] if i - 1 < len(transition_plan) else None
-            if prev is not None:
-                transition_enabled = bool(prev.transition_after) and style != "none"
-                trans_dur = max(0.1, min(float(prev.transition_seconds), 0.8))
-                transition_kind = prev.transition_type if prev.transition_type in SEGMENT_TRANSITIONS else "jump_cut"
-            else:
-                transition_kind = "jump_cut"
-        else:
-            transition_kind = "jump_cut"
+    for cut_order, cut_idx in enumerate(active_cut_indices):
+        effect = sequence[cut_order]
+        counts[effect] = counts.get(effect, 0) + 1
+        direction = -1 if (cut_idx % 2) else 1
 
-        if transition_enabled:
-            if transition_kind == "jump_cut":
-                pass
-            elif transition_kind == "zoom_in":
-                clip = _apply_ken_burns(clip, zoom_ratio=0.09).crossfadein(max(0.10, trans_dur))
-                start = max(0.0, cursor - max(0.10, trans_dur))
-                applied += 1
-            elif transition_kind == "whip":
-                whip_dur = max(0.08, min(trans_dur, 0.16))
-                clip = clip.crossfadein(whip_dur)
-                start = max(0.0, cursor - whip_dur)
-                applied += 1
-            elif transition_kind == "fade":
-                fade_dur = max(0.10, trans_dur)
-                clip = clip.fadein(fade_dur)
-                if timeline:
-                    timeline[-1] = timeline[-1].fadeout(fade_dur)
-                applied += 1
+        if effect == "zoom_punch":
+            prepared[cut_idx] = _apply_zoom_punch_outgoing(prepared[cut_idx], fps=fps)
+        elif effect == "whip_pan":
+            prepared[cut_idx] = _apply_whip_pan_outgoing(prepared[cut_idx], fps=fps, direction=direction)
+        elif effect == "smash_cut":
+            prepared[cut_idx + 1] = _apply_smash_cut_incoming(prepared[cut_idx + 1], fps=fps)
+        elif effect == "glitch_cut":
+            prepared[cut_idx + 1] = _apply_glitch_cut_incoming(prepared[cut_idx + 1], fps=fps, direction=direction)
+        elif effect == "fade_black":
+            fade_frames = rng.choice((2, 3, 4))
+            prepared[cut_idx], prepared[cut_idx + 1] = _apply_fade_black_pair(
+                prepared[cut_idx],
+                prepared[cut_idx + 1],
+                fps=fps,
+                frame_count=fade_frames,
+            )
 
-        timeline.append(clip.set_start(start))
-        cursor = max(cursor, start + clip.duration)
-
-    return CompositeVideoClip(timeline, size=size).set_duration(cursor), applied
+    final_clip = concatenate_videoclips(prepared, method="compose")
+    return final_clip, len(active_cut_indices), {k: v for k, v in counts.items() if v > 0}
 
 
 def _window_energy(clip: AudioClip, center: float, window: float = 0.16, samples: int = 11) -> float:
@@ -1136,15 +1328,18 @@ def render_video(
             log=log,
         )
 
-        log(f"Applying adaptive '{transition_style}' transitions")
-        final_video, transition_count = _compose_with_adaptive_transitions(
+        log("Applying weighted professional transitions")
+        final_video, transition_count, transition_counts = _compose_with_adaptive_transitions(
             clips=assembled,
             transition_plan=timeline_clips,
             style=transition_style,
-            default_dur=transition_duration,
+            fps=fps,
             size=(width, height),
         )
         log(f"Transitions applied: {transition_count}")
+        if transition_counts:
+            detail = ", ".join(f"{name}={count}" for name, count in sorted(transition_counts.items()))
+            log(f"Transition mix: {detail}")
 
         final_video = _apply_micro_zooms(final_video)
         log(
