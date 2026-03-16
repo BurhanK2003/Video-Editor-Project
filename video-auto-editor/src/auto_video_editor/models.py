@@ -3,10 +3,18 @@ from pathlib import Path
 
 
 @dataclass
+class WordToken:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
 class TranscriptSegment:
     start: float
     end: float
     text: str
+    words: list[WordToken] | None = None
 
 
 @dataclass
@@ -15,6 +23,17 @@ class PlannedSegment:
     end: float
     text: str
     duration: float
+    transition_after: bool = True
+    transition_seconds: float = 0.22
+    emphasis: bool = False
+    highlight_phrase: str = ""
+    emphasis_words: list[str] | None = None
+    word_tokens: list[WordToken] | None = None
+    visual_query: str = ""
+    emotion: str = "curiosity"
+    pacing: str = "fast"
+    transition_type: str = "jump_cut"
+    clip_length_seconds: float = 2.0
 
 
 @dataclass
@@ -22,6 +41,11 @@ class TimelineClip:
     source_path: Path
     timeline_start: float
     timeline_end: float
+    transition_after: bool = True
+    transition_seconds: float = 0.2
+    transition_type: str = "jump_cut"
+    emotion: str = "curiosity"
+    plan_idx: int = 0
 
 
 @dataclass
@@ -37,3 +61,12 @@ class AutoEditRequest:
     render_preset: str = "veryfast"
     allow_stock_fetch: bool = True
     stock_keywords: str = ""
+    transition_style: str = "crossfade"  # none | crossfade | zoom | fade_black
+    transition_duration: float = 0.22
+    caption_style: str = "beast"
+    caption_position_ratio: float | None = None
+    caption_max_lines: int | None = None
+    caption_font_scale: float = 1.0
+    caption_pop_scale: float = 1.0
+    enable_adaptive_caption_safe_zones: bool = True
+    enable_karaoke_highlight: bool = True
