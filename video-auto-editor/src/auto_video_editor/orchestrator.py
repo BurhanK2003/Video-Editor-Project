@@ -11,8 +11,22 @@ from .transcribe import transcribe_voiceover
 
 def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
     log("Starting auto-edit pipeline...")
+
+    # Script-to-video: generate voiceover from text if no audio file was provided.
+    voiceover_path = request.voiceover_path
+    if request.script_text.strip() and (not voiceover_path or not voiceover_path.exists()):
+        from .tts import generate_voiceover
+        tts_out = request.output_path.with_suffix(".tts.wav")
+        log("Script-to-video: generating voiceover with free TTS...")
+        voiceover_path = generate_voiceover(
+            text=request.script_text,
+            output_path=tts_out,
+            voice=request.script_voice or "",
+            log=log,
+        )
+        log(f"Voiceover generated: {voiceover_path}")
     segments = transcribe_voiceover(
-        voiceover_path=request.voiceover_path,
+        voiceover_path=voiceover_path,
         model_size=request.whisper_model,
         log=log,
     )
@@ -44,7 +58,7 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
     render_video(
         timeline_clips=timeline,
         subtitle_plan=plan,
-        voiceover_path=request.voiceover_path,
+        voiceover_path=voiceover_path,
         output_path=request.output_path,
         width=request.output_width,
         height=request.output_height,
