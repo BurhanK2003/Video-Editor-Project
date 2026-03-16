@@ -1,9 +1,124 @@
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
+from urllib.request import Request, urlopen
 
 from .matcher import suggest_scene_keywords
 from .models import PlannedSegment, TranscriptSegment, WordToken
+
+
+# ---------------------------------------------------------------------------
+# Free AI query generation (Ollama → Groq → keyword fallback)
+# ---------------------------------------------------------------------------
+
+_QUERY_CACHE: dict[str, str] = {}
+_QUERY_CACHE_FILE = Path(".llm_query_cache.json")
+_CACHE_LOADED = False
+
+
+def _load_query_cache() -> None:
+    global _CACHE_LOADED
+    if _CACHE_LOADED:
+        return
+    _CACHE_LOADED = True
+    try:
+        if _QUERY_CACHE_FILE.exists():
+            _QUERY_CACHE.update(json.loads(_QUERY_CACHE_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+
+
+def _save_query_cache() -> None:
+    try:
+        _QUERY_CACHE_FILE.write_text(
+            json.dumps(_QUERY_CACHE, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _call_ollama(prompt: str) -> str | None:
+    """Call local Ollama (http://localhost:11434). Free, no API key, runs offline."""
+    payload = json.dumps({
+        "model": "llama3.2",
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.4, "num_predict": 32},
+    }).encode()
+    try:
+        req = Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=8) as resp:
+            result = json.loads(resp.read().decode())
+            return (result.get("response") or "").strip()
+    except Exception:
+        return None
+
+
+def _call_groq(prompt: str) -> str | None:
+    """Call Groq free-tier API (requires GROQ_API_KEY env var, llama-3.3-70b-versatile)."""
+    import os
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 32,
+        "temperature": 0.4,
+    }).encode()
+    try:
+        req = Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urlopen(req, timeout=12) as resp:
+            result = json.loads(resp.read().decode())
+            return (result["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return None
+
+
+def _llm_cinematic_query(text: str, emotion: str) -> str | None:
+    """
+    Use a free LLM (Ollama locally, Groq cloud) to write a specific cinematic
+    stock footage search query for the given narration line.
+
+    Results are cached by (text, emotion) so repeated runs are instant.
+    Falls back to None if no LLM is reachable (caller uses keyword fallback).
+    """
+    _load_query_cache()
+    cache_key = f"{text.lower().strip()}|{emotion}"
+    if cache_key in _QUERY_CACHE:
+        return _QUERY_CACHE[cache_key]
+
+    prompt = (
+        f'You are helping find stock footage for a short video.\n'
+        f'The narrator says: "{text}"\n'
+        f'Scene emotion: {emotion}\n'
+        f"Write ONE cinematic stock footage search query, max 8 words, "
+        f"no quotes. Focus on VISUALS not words. Be specific and concrete. "
+        f"Reply with ONLY the query, nothing else."
+    )
+
+    result = _call_ollama(prompt) or _call_groq(prompt)
+    if result:
+        # Sanitise: strip quotes, truncate to 10 words max.
+        cleaned = re.sub(r'["\'\n]', "", result).strip()
+        cleaned = " ".join(cleaned.split()[:10])
+        if len(cleaned) > 4:
+            _QUERY_CACHE[cache_key] = cleaned
+            _save_query_cache()
+            return cleaned
+    return None
 
 
 BRAND_PHRASE = "Nature Lives In You"
@@ -292,6 +407,12 @@ def _transition_for_segment(
 
 
 def _cinematic_query(text: str, emotion: str) -> str:
+    # Try free LLM first — much more creative and specific than keyword extraction.
+    llm_result = _llm_cinematic_query(text, emotion)
+    if llm_result:
+        return llm_result
+
+    # Keyword fallback (no LLM available).
     raw_keywords = suggest_scene_keywords(text, max_keywords=6)
     filtered: list[str] = []
     for kw in raw_keywords:

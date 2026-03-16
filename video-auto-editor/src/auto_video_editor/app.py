@@ -34,6 +34,7 @@ class AutoEditorApp:
         self.root = root
         self.root.title("Local Auto Video Editor")
         self.root.geometry("980x700")
+        self.root.minsize(820, 560)
 
         self.voiceover_var = tk.StringVar()
         self.clips_var = tk.StringVar()
@@ -57,6 +58,9 @@ class AutoEditorApp:
         self.caption_pop_scale_var = tk.DoubleVar(value=1.00)
         self.adaptive_safe_zones_var = tk.BooleanVar(value=True)
         self.karaoke_highlight_var = tk.BooleanVar(value=True)
+        # Script-to-video
+        self.script_text_var = tk.StringVar()
+        self.script_voice_var = tk.StringVar(value="en-US-AriaNeural")
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -65,8 +69,34 @@ class AutoEditorApp:
         self._poll_log_queue()
 
     def _build_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill="both", expand=True)
+        outer = ttk.Frame(self.root, padding=8)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        frame = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        def _sync_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_canvas_window_width(event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        frame.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_canvas_window_width)
+
+        # Scroll using mouse wheel while pointer is over the editor content.
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         self._path_row(
             frame,
@@ -74,6 +104,22 @@ class AutoEditorApp:
             text_var=self.voiceover_var,
             browse_command=self._pick_voiceover,
         )
+
+        # Script-to-video section (collapsed by default via LabelFrame).
+        script_frame = ttk.LabelFrame(frame, text="Script-to-Video  (leave Voiceover empty to use TTS)", padding=6)
+        script_frame.pack(fill="x", pady=(0, 4))
+        ttk.Label(script_frame, text="Script").grid(row=0, column=0, padx=6, sticky="nw")
+        self.script_text_widget = tk.Text(script_frame, height=3, wrap="word")
+        self.script_text_widget.grid(row=0, column=1, columnspan=3, padx=6, sticky="ew")
+        script_frame.columnconfigure(1, weight=1)
+        ttk.Label(script_frame, text="Voice").grid(row=1, column=0, padx=6, pady=(4, 0), sticky="w")
+        ttk.Entry(script_frame, textvariable=self.script_voice_var, width=28).grid(
+            row=1, column=1, padx=6, pady=(4, 0), sticky="w"
+        )
+        ttk.Label(script_frame, text="e.g. en-US-GuyNeural", foreground="grey").grid(
+            row=1, column=2, padx=4, pady=(4, 0), sticky="w"
+        )
+
         self._path_row(
             frame,
             label="Clips Folder (optional)",
@@ -234,8 +280,21 @@ class AutoEditorApp:
         logs_label = ttk.Label(frame, text="Pipeline Log")
         logs_label.pack(anchor="w")
 
-        self.log_box = tk.Text(frame, height=20, wrap="word", state="disabled")
-        self.log_box.pack(fill="both", expand=True)
+        log_frame = ttk.Frame(frame)
+        log_frame.pack(fill="both", expand=True)
+
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical")
+        self.log_box = tk.Text(
+            log_frame,
+            height=18,
+            wrap="word",
+            state="disabled",
+            yscrollcommand=log_scroll.set,
+        )
+        log_scroll.configure(command=self.log_box.yview)
+
+        self.log_box.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
 
     def _path_row(
         self,
@@ -247,7 +306,7 @@ class AutoEditorApp:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
 
-        ttk.Label(row, text=label, width=12).pack(side="left")
+        ttk.Label(row, text=label, width=20).pack(side="left")
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Button(row, text="Browse", command=browse_command).pack(side="left")
 
@@ -260,7 +319,7 @@ class AutoEditorApp:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
 
-        ttk.Label(row, text=label, width=12).pack(side="left")
+        ttk.Label(row, text=label, width=20).pack(side="left")
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True)
 
     def _pick_voiceover(self) -> None:
@@ -308,15 +367,20 @@ class AutoEditorApp:
         self.root.after(100, self._poll_log_queue)
 
     def _collect_request(self) -> AutoEditRequest:
-        voiceover = Path(self.voiceover_var.get().strip())
+        voiceover_raw = self.voiceover_var.get().strip()
+        voiceover = Path(voiceover_raw) if voiceover_raw else None
         clips_raw = self.clips_var.get().strip()
         clips_folder = Path(clips_raw) if clips_raw else None
         output = Path(self.output_var.get().strip())
         music_raw = self.music_var.get().strip()
         music = Path(music_raw) if music_raw else None
+        script_text = self.script_text_widget.get("1.0", "end").strip()
+        script_voice = self.script_voice_var.get().strip()
 
-        if not voiceover.exists() or not voiceover.is_file():
-            raise ValueError("Voiceover file is required and must exist.")
+        if not script_text and (not voiceover or not voiceover.exists() or not voiceover.is_file()):
+            raise ValueError("Provide a Voiceover file OR paste a Script for TTS.")
+        if voiceover and voiceover_raw and (not voiceover.exists() or not voiceover.is_file()):
+            raise ValueError("Voiceover file does not exist.")
         if clips_folder and (not clips_folder.exists() or not clips_folder.is_dir()):
             raise ValueError("Clips folder must exist if provided.")
         if music and (not music.exists() or not music.is_dir()):
@@ -327,7 +391,7 @@ class AutoEditorApp:
             raise ValueError("Provide a clips folder or enable stock footage fetching.")
 
         return AutoEditRequest(
-            voiceover_path=voiceover,
+            voiceover_path=voiceover or Path(""),
             clips_folder=clips_folder,
             output_path=output,
             music_folder=music,
@@ -347,6 +411,8 @@ class AutoEditorApp:
             caption_pop_scale=float(self.caption_pop_scale_var.get()),
             enable_adaptive_caption_safe_zones=self.adaptive_safe_zones_var.get(),
             enable_karaoke_highlight=self.karaoke_highlight_var.get(),
+            script_text=script_text,
+            script_voice=script_voice,
         )
 
     def _start_auto_edit(self) -> None:

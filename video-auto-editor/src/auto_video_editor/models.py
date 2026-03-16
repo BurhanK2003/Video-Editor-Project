@@ -70,3 +70,6 @@ class AutoEditRequest:
     caption_pop_scale: float = 1.0
     enable_adaptive_caption_safe_zones: bool = True
     enable_karaoke_highlight: bool = True
+    # Script-to-video: supply a script instead of a pre-recorded voiceover.
+    script_text: str = ""
+    script_voice: str = ""  # edge-tts voice name, e.g. "en-US-AriaNeural"; empty = auto
