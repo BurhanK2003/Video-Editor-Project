@@ -22,6 +22,12 @@ TRANSITION_STYLE_MAP = {
     "Fade Black": "fade_black",
 }
 
+CAPTION_STYLE_MAP = {
+    "Beast": "beast",
+    "Clean": "clean",
+    "Kinetic": "kinetic",
+}
+
 
 class AutoEditorApp:
     def __init__(self, root: tk.Tk):
@@ -43,6 +49,14 @@ class AutoEditorApp:
         self.allow_stock_fetch_var = tk.BooleanVar(value=True)
         self.transition_style_var = tk.StringVar(value="Crossfade")
         self.transition_duration_var = tk.DoubleVar(value=0.22)
+        self.caption_style_var = tk.StringVar(value="Beast")
+        self.whisper_model_var = tk.StringVar(value="base")
+        self.caption_position_ratio_var = tk.DoubleVar(value=0.54)
+        self.caption_max_lines_var = tk.IntVar(value=3)
+        self.caption_font_scale_var = tk.DoubleVar(value=1.00)
+        self.caption_pop_scale_var = tk.DoubleVar(value=1.00)
+        self.adaptive_safe_zones_var = tk.BooleanVar(value=True)
+        self.karaoke_highlight_var = tk.BooleanVar(value=True)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -136,6 +150,83 @@ class AutoEditorApp:
             width=8,
             format="%.1f",
         ).grid(row=3, column=3, padx=8, pady=6, sticky="w")
+
+        ttk.Label(settings, text="Captions").grid(row=4, column=0, padx=8, pady=6, sticky="w")
+        ttk.Combobox(
+            settings,
+            textvariable=self.caption_style_var,
+            values=list(CAPTION_STYLE_MAP.keys()),
+            state="readonly",
+            width=12,
+        ).grid(row=4, column=1, padx=8, pady=6, sticky="w")
+
+        ttk.Label(settings, text="Whisper").grid(row=4, column=2, padx=8, pady=6, sticky="w")
+        ttk.Combobox(
+            settings,
+            textvariable=self.whisper_model_var,
+            values=["tiny", "base", "small", "medium", "large"],
+            state="readonly",
+            width=10,
+        ).grid(row=4, column=3, padx=8, pady=6, sticky="w")
+
+        subtitle_style = ttk.LabelFrame(frame, text="Subtitle Styling Editor", padding=8)
+        subtitle_style.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(subtitle_style, text="Vertical Pos").grid(row=0, column=0, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            subtitle_style,
+            from_=0.40,
+            to=0.75,
+            increment=0.01,
+            textvariable=self.caption_position_ratio_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=0, column=1, padx=8, pady=6, sticky="w")
+
+        ttk.Label(subtitle_style, text="Max Lines").grid(row=0, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            subtitle_style,
+            from_=1,
+            to=5,
+            increment=1,
+            textvariable=self.caption_max_lines_var,
+            width=8,
+            format="%.0f",
+        ).grid(row=0, column=3, padx=8, pady=6, sticky="w")
+
+        ttk.Label(subtitle_style, text="Font Scale").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            subtitle_style,
+            from_=0.70,
+            to=1.60,
+            increment=0.05,
+            textvariable=self.caption_font_scale_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=1, column=1, padx=8, pady=6, sticky="w")
+
+        ttk.Label(subtitle_style, text="Pop Scale").grid(row=1, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            subtitle_style,
+            from_=0.60,
+            to=1.80,
+            increment=0.05,
+            textvariable=self.caption_pop_scale_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=1, column=3, padx=8, pady=6, sticky="w")
+
+        ttk.Checkbutton(
+            subtitle_style,
+            text="Adaptive safe zones",
+            variable=self.adaptive_safe_zones_var,
+        ).grid(row=2, column=0, columnspan=2, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Checkbutton(
+            subtitle_style,
+            text="Per-word karaoke highlight",
+            variable=self.karaoke_highlight_var,
+        ).grid(row=2, column=2, columnspan=2, padx=8, pady=(2, 6), sticky="w")
 
         self.run_button = ttk.Button(frame, text="Auto Edit", command=self._start_auto_edit)
         self.run_button.pack(fill="x", pady=(8, 10))
@@ -248,6 +339,14 @@ class AutoEditorApp:
             stock_keywords=self.stock_keywords_var.get().strip(),
             transition_style=TRANSITION_STYLE_MAP.get(self.transition_style_var.get(), "crossfade"),
             transition_duration=float(self.transition_duration_var.get()),
+            caption_style=CAPTION_STYLE_MAP.get(self.caption_style_var.get(), "beast"),
+            whisper_model=self.whisper_model_var.get() or "base",
+            caption_position_ratio=float(self.caption_position_ratio_var.get()),
+            caption_max_lines=int(self.caption_max_lines_var.get()),
+            caption_font_scale=float(self.caption_font_scale_var.get()),
+            caption_pop_scale=float(self.caption_pop_scale_var.get()),
+            enable_adaptive_caption_safe_zones=self.adaptive_safe_zones_var.get(),
+            enable_karaoke_highlight=self.karaoke_highlight_var.get(),
         )
 
     def _start_auto_edit(self) -> None:

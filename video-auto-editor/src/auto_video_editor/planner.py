@@ -27,6 +27,131 @@ EMOTION_WORDS = {
     "excitement": {"amazing", "incredible", "wow", "powerful", "boost", "fast"},
 }
 TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
+NATURE_THEME_TERMS = ("nature", "wildlife", "documentary", "outdoors")
+NOISE_KEYWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "this",
+    "that",
+    "these",
+    "those",
+    "there",
+    "theres",
+    "it's",
+    "its",
+    "you",
+    "your",
+    "okay",
+    "ok",
+    "seen",
+    "thought",
+    "check",
+    "double",
+    "all",
+    "but",
+    "had",
+    "even",
+    "days",
+    "day",
+    "six",
+    "button",
+    "follow",
+    "hit",
+    "dropped",
+    "drop",
+    "like",
+    "subscribe",
+    "watch",
+    "now",
+    "today",
+    "really",
+    "just",
+    "im",
+    "ive",
+    "id",
+}
+
+SCENE_INTENTS: list[tuple[re.Pattern[str], dict[str, str | float]]] = [
+    (
+        re.compile(r"\brain\b|\braindrops?\b|\bcalm\b", re.IGNORECASE),
+        {
+            "query": "cinematic close-up raindrops leaves window slow motion nature 4k",
+            "emotion": "curiosity",
+            "transition_type": "fade",
+            "clip_length_seconds": 1.8,
+        },
+    ),
+    (
+        re.compile(r"\bwalk\b|\bforest\b|\bhome\b", re.IGNORECASE),
+        {
+            "query": "cinematic forest trail walking sunlight leaves pov nature 4k",
+            "emotion": "curiosity",
+            "transition_type": "jump_cut",
+            "clip_length_seconds": 1.6,
+        },
+    ),
+    (
+        re.compile(r"\bwithin\b|\binside\b|\breflection\b|\breflections\b", re.IGNORECASE),
+        {
+            "query": "cinematic reflection water mirror human silhouette petals nature 4k",
+            "emotion": "suspense",
+            "transition_type": "fade",
+            "clip_length_seconds": 1.9,
+        },
+    ),
+    (
+        re.compile(r"\bbirds?\b|\bdeer\b|\binsects?\b|\bwildlife\b|\banimals?\b", re.IGNORECASE),
+        {
+            "query": "cinematic wildlife birds deer insects macro natural habitat 4k",
+            "emotion": "excitement",
+            "transition_type": "jump_cut",
+            "clip_length_seconds": 1.3,
+        },
+    ),
+    (
+        re.compile(r"\baerial\b|\bmountains?\b|\brivers?\b|\bocean\b|\bclouds?\b", re.IGNORECASE),
+        {
+            "query": "cinematic aerial forest mountains river drone landscape nature 4k",
+            "emotion": "curiosity",
+            "transition_type": "fade",
+            "clip_length_seconds": 1.8,
+        },
+    ),
+    (
+        re.compile(r"nature lives in you", re.IGNORECASE),
+        {
+            "query": "cinematic logo text glow forest mist sunlight nature lives in you 4k",
+            "emotion": "curiosity",
+            "transition_type": "fade",
+            "clip_length_seconds": 2.0,
+        },
+    ),
+    (
+        re.compile(r"\bsubscribe\b|\bfollow\b|\bcomment\b|\btell us\b", re.IGNORECASE),
+        {
+            "query": "cinematic hands touching water sunlight leaves call to action nature 4k",
+            "emotion": "excitement",
+            "transition_type": "zoom_in",
+            "clip_length_seconds": 1.4,
+        },
+    ),
+]
 
 
 def _normalize_brand_phrase(text: str) -> str:
@@ -81,30 +206,44 @@ def _apply_caps_style(text: str, emphasis_words: list[str]) -> str:
 
 
 def _chunk_size(words_per_second: float) -> int:
-    # Viral style pacing: faster voice means smaller caption chunks.
-    if words_per_second >= 3.4:
-        return 2
-    if words_per_second >= 2.7:
-        return 3
-    if words_per_second >= 1.9:
+    # Keep captions readable and semantically useful; avoid hyper-fragmented 2-word subtitles.
+    if words_per_second >= 3.6:
         return 4
-    return 5
+    if words_per_second >= 2.8:
+        return 5
+    if words_per_second >= 2.0:
+        return 6
+    return 7
 
 
 def _chunk_words(words: list[WordToken], target_size: int) -> list[list[WordToken]]:
     chunks: list[list[WordToken]] = []
-    i = 0
-    while i < len(words):
-        chunk = words[i : i + target_size]
-        i += target_size
-        if len(chunk) == 1 and chunks:
-            chunks[-1].extend(chunk)
-            continue
-        if len(chunk) > 6:
-            chunk = chunk[:6]
-        chunks.append(chunk)
+    current: list[WordToken] = []
+    for word in words:
+        current.append(word)
+        token = (word.text or "").strip()
+        hit_punctuation = token.endswith((".", "!", "?", ",", ";", ":"))
+        if len(current) >= max(3, target_size) or (hit_punctuation and len(current) >= 3):
+            chunks.append(current)
+            current = []
 
-    # Enforce minimum 2 words where possible.
+    if current:
+        if chunks and len(current) <= 2:
+            chunks[-1].extend(current)
+        else:
+            chunks.append(current)
+
+    normalized: list[list[WordToken]] = []
+    for chunk in chunks:
+        if len(chunk) > 8:
+            normalized.append(chunk[:8])
+            remainder = chunk[8:]
+            if remainder:
+                normalized.append(remainder)
+        else:
+            normalized.append(chunk)
+    chunks = normalized
+
     if len(chunks) >= 2 and len(chunks[-1]) == 1:
         chunks[-2].extend(chunks[-1])
         chunks.pop()
@@ -153,8 +292,24 @@ def _transition_for_segment(
 
 
 def _cinematic_query(text: str, emotion: str) -> str:
-    keywords = suggest_scene_keywords(text, max_keywords=3)
-    base = " ".join(keywords) if keywords else "nature"
+    raw_keywords = suggest_scene_keywords(text, max_keywords=6)
+    filtered: list[str] = []
+    for kw in raw_keywords:
+        token = re.sub(r"[^a-zA-Z]+", "", kw).lower()
+        if len(token) < 3 or token in NOISE_KEYWORDS:
+            continue
+        filtered.append(token)
+
+    # Put content-specific words first; keep nature anchors as fallback context.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in [*filtered, *NATURE_THEME_TERMS]:
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+
+    base = " ".join(deduped[:7]) if deduped else "nature wildlife documentary"
 
     if BRAND_PHRASE.lower() in text.lower():
         return "cinematic forest mist sunlight nature life close-up 4k"
@@ -164,6 +319,13 @@ def _cinematic_query(text: str, emotion: str) -> str:
     if emotion == "excitement":
         return f"cinematic action {base} dynamic movement 4k"
     return f"cinematic {base} natural light movement 4k"
+
+
+def _scene_intent_profile(text: str) -> dict[str, str | float]:
+    for pattern, profile in SCENE_INTENTS:
+        if pattern.search(text):
+            return dict(profile)
+    return {}
 
 
 def _words_from_segment(seg: TranscriptSegment) -> list[WordToken]:
@@ -210,16 +372,20 @@ def build_plan(segments: list[TranscriptSegment]) -> list[PlannedSegment]:
 
             chunk_text = _normalize_brand_phrase(" ".join(w.text for w in chunk).strip())
             emphasis_words = _important_words(chunk_text)
-            emotion = _emotion_for_text(chunk_text)
+            intent = _scene_intent_profile(chunk_text)
+            emotion = str(intent.get("emotion") or _emotion_for_text(chunk_text))
             transition_type = _transition_for_segment(
                 text=chunk_text,
                 emotion=emotion,
                 words_per_second=words_per_second,
                 prev_transitions=recent_transitions,
             )
+            if intent.get("transition_type"):
+                transition_type = str(intent["transition_type"])
             recent_transitions.append(transition_type)
 
-            transition_after = clip_len >= 1.2 and consumed_words < len(words)
+            segment_clip_len = float(intent.get("clip_length_seconds") or clip_len)
+            transition_after = segment_clip_len >= 1.1 and consumed_words < len(words)
             if transition_type == "fade":
                 transition_seconds = 0.22
             elif transition_type == "zoom_in":
@@ -250,11 +416,15 @@ def build_plan(segments: list[TranscriptSegment]) -> list[PlannedSegment]:
                     or alternating_emphasis,
                     highlight_phrase=BRAND_PHRASE if BRAND_PHRASE.lower() in styled_text.lower() else "",
                     emphasis_words=emphasis_words,
-                    visual_query=_cinematic_query(styled_text, emotion),
+                    word_tokens=[
+                        WordToken(start=float(w.start), end=float(w.end), text=w.text)
+                        for w in chunk
+                    ],
+                    visual_query=str(intent.get("query") or _cinematic_query(styled_text, emotion)),
                     emotion=emotion,
                     pacing="fast",
                     transition_type=transition_type,
-                    clip_length_seconds=clip_len,
+                    clip_length_seconds=segment_clip_len,
                 )
             )
 

@@ -9,7 +9,6 @@ from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .matcher import suggest_scene_keywords
 from .models import PlannedSegment
 
 STOP_WORDS = {
@@ -38,11 +37,12 @@ STOP_WORDS = {
     "with",
     "would",
 }
-DEFAULT_QUERIES = ["background", "nature", "business", "people"]
+DEFAULT_QUERIES = ["wildlife", "nature outdoors", "animals"]
 MIN_DOWNLOADS_PER_KEYWORD = 1
 MAX_RESULTS_PER_KEYWORD = 5
-MAX_DOWNLOADS_PER_KEYWORD = 2
+MAX_DOWNLOADS_PER_KEYWORD = 3
 USER_AGENT = "local-auto-video-editor/1.0"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def fetch_stock_clips(
@@ -65,7 +65,12 @@ def fetch_stock_clips(
     downloaded: list[Path] = []
     seen_paths: set[Path] = set()
 
+    if keywords_override.strip():
+        log(f"Manual stock hint(s): {keywords_override.strip()}")
     log(f"Stock keyword count: {len(queries)} | Target downloaded clips: {target_count}")
+    if queries:
+        preview = "; ".join(queries[:4])
+        log(f"Stock query preview: {preview}")
 
     if pexels_key and len(downloaded) < target_count:
         downloaded.extend(
@@ -95,28 +100,61 @@ def fetch_stock_clips(
             )
         )
 
+    if pexels_key and len(downloaded) < target_count:
+        downloaded.extend(
+            _download_images_from_pexels(
+                api_key=pexels_key,
+                queries=queries,
+                cache_dir=cache_dir / "pexels_images",
+                target_count=target_count - len(downloaded),
+                seen_paths=seen_paths,
+                log=log,
+            )
+        )
+
+    if pixabay_key and len(downloaded) < target_count:
+        downloaded.extend(
+            _download_images_from_pixabay(
+                api_key=pixabay_key,
+                queries=queries,
+                cache_dir=cache_dir / "pixabay_images",
+                target_count=target_count - len(downloaded),
+                seen_paths=seen_paths,
+                log=log,
+            )
+        )
+
     return downloaded
 
 
 def _build_queries(plan: list[PlannedSegment], keywords_override: str) -> list[str]:
-    if keywords_override.strip():
-        return _dedupe(
-            part.strip()
-            for part in re.split(r"[,\n]+", keywords_override)
-            if part.strip()
-        )
+    manual_terms = [
+        part.strip()
+        for part in re.split(r"[,\n]+", keywords_override)
+        if part.strip()
+    ]
 
     derived = []
-    for segment in plan[:14]:
+    for segment in plan[:20]:
         if segment.visual_query.strip():
+            # Use the planner's cinematic query directly — already well-formed.
             derived.append(segment.visual_query.strip())
 
-    for segment in plan[:10]:
-        keywords = suggest_scene_keywords(segment.text, max_keywords=3)
-        if keywords:
-            derived.append(f"cinematic {' '.join(keywords)} 4k")
+    base_queries = _dedupe(derived + DEFAULT_QUERIES)
 
-    return _dedupe(derived + ["cinematic nature 4k", *DEFAULT_QUERIES])
+    if not manual_terms:
+        return base_queries
+
+    manual_phrase = " ".join(manual_terms)
+    blended: list[str] = []
+    for query in base_queries[:14]:
+        blended.append(f"{manual_phrase} {query}".strip())
+
+    # Keep some pure AI queries too so user hints guide search without collapsing diversity.
+    blended.extend(base_queries[:8])
+    blended.append(f"cinematic {manual_phrase} wildlife nature 4k".strip())
+    blended.append(manual_phrase)
+    return _dedupe(blended)
 
 
 def _download_from_pexels(
@@ -227,6 +265,92 @@ def _download_from_pixabay(
     return results
 
 
+def _download_images_from_pexels(
+    api_key: str,
+    queries: list[str],
+    cache_dir: Path,
+    target_count: int,
+    seen_paths: set[Path],
+    log: callable,
+) -> list[Path]:
+    results: list[Path] = []
+    for query in queries:
+        if len(results) >= target_count:
+            break
+        params = urlencode({"query": query, "per_page": 3, "orientation": "portrait"})
+        request = Request(
+            f"https://api.pexels.com/v1/search?{params}",
+            headers={"Authorization": api_key, "User-Agent": USER_AGENT},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            continue
+
+        for photo in payload.get("photos", []):
+            if len(results) >= target_count:
+                break
+            image_url = str(((photo.get("src") or {}).get("large2x") or (photo.get("src") or {}).get("portrait") or "")).strip()
+            if not image_url:
+                continue
+            destination = cache_dir / f"pexels_photo_{photo['id']}.jpg"
+            metadata = {
+                "provider": "pexels-image",
+                "query": query,
+                "title": str(photo.get("url") or ""),
+                "tags": str(photo.get("alt") or ""),
+            }
+            clip_path = _download_binary(image_url, destination, seen_paths, log, metadata, asset_label="stock image")
+            if clip_path is not None:
+                results.append(clip_path)
+                break
+    return results
+
+
+def _download_images_from_pixabay(
+    api_key: str,
+    queries: list[str],
+    cache_dir: Path,
+    target_count: int,
+    seen_paths: set[Path],
+    log: callable,
+) -> list[Path]:
+    results: list[Path] = []
+    for query in queries:
+        if len(results) >= target_count:
+            break
+        params = urlencode({"key": api_key, "q": query, "per_page": 3, "image_type": "photo", "orientation": "vertical"})
+        request = Request(
+            f"https://pixabay.com/api/?{params}",
+            headers={"User-Agent": USER_AGENT},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            continue
+
+        for photo in payload.get("hits", []):
+            if len(results) >= target_count:
+                break
+            image_url = str(photo.get("largeImageURL") or photo.get("webformatURL") or "").strip()
+            if not image_url:
+                continue
+            destination = cache_dir / f"pixabay_photo_{photo['id']}.jpg"
+            metadata = {
+                "provider": "pixabay-image",
+                "query": query,
+                "title": str(photo.get("pageURL") or ""),
+                "tags": str(photo.get("tags") or ""),
+            }
+            clip_path = _download_binary(image_url, destination, seen_paths, log, metadata, asset_label="stock image")
+            if clip_path is not None:
+                results.append(clip_path)
+                break
+    return results
+
+
 def _select_pexels_video_url(video: dict, width: int, height: int) -> str | None:
     video_files = video.get("video_files", [])
     best_url = None
@@ -276,6 +400,17 @@ def _download_video(
     log: callable,
     metadata: dict,
 ) -> Path | None:
+    return _download_binary(url, destination, seen_paths, log, metadata, asset_label="stock clip")
+
+
+def _download_binary(
+    url: str,
+    destination: Path,
+    seen_paths: set[Path],
+    log: callable,
+    metadata: dict,
+    asset_label: str,
+) -> Path | None:
     if destination in seen_paths:
         return None
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -283,7 +418,7 @@ def _download_video(
 
     if destination.exists() and destination.stat().st_size > 0:
         _write_metadata_sidecar(destination, metadata)
-        log(f"Using cached stock clip: {destination.name}")
+        log(f"Using cached {asset_label}: {destination.name}")
         return destination
 
     temp_path = destination.with_suffix(destination.suffix + ".part")
@@ -293,12 +428,12 @@ def _download_video(
             shutil.copyfileobj(response, handle)
         temp_path.replace(destination)
         _write_metadata_sidecar(destination, metadata)
-        log(f"Downloaded stock clip: {destination.name}")
+        log(f"Downloaded {asset_label}: {destination.name}")
         return destination
     except Exception as exc:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
-        log(f"Stock clip download failed for {destination.name}: {exc}")
+        log(f"{asset_label.capitalize()} download failed for {destination.name}: {exc}")
         return None
 
 
@@ -370,8 +505,8 @@ def _dedupe(items: Iterable[str]) -> list[str]:
 
 def _target_clip_count(plan: list[PlannedSegment], queries: list[str], keywords_override: str) -> int:
     if queries:
-        # Keep 1-2 clips per keyword and avoid exploding the download count.
-        keyword_scaled_target = MIN_DOWNLOADS_PER_KEYWORD * len(queries)
-        hard_cap = MAX_DOWNLOADS_PER_KEYWORD * len(queries)
+        # Keep download volume tied to scene count, not just manual keyword count.
+        keyword_scaled_target = max(len(plan), min(8, len(plan) + 2))
+        hard_cap = max(8, MAX_DOWNLOADS_PER_KEYWORD * len(queries))
         return min(max(len(plan), keyword_scaled_target), hard_cap)
     return min(max(3, len(plan)), 8)

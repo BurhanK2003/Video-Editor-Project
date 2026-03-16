@@ -10,6 +10,8 @@ This is a local-first desktop prototype for auto-editing videos from a voiceover
 - Auto-transcribe the voiceover (if `faster-whisper` is installed and model download succeeds)
 - Build a rough cut by matching transcript segments to clips
 - Auto-mix background music under voiceover
+- Adaptive caption-safe zones that move subtitles away from likely subject regions
+- Per-word karaoke highlight timing from word-level transcript timestamps
 - Export final MP4
 
 ## Tech
@@ -75,6 +77,11 @@ Phase 1 AI matching now does three things:
 - Uses those keywords to search stock clips.
 - Picks the best clip per scene using semantic matching (when `sentence-transformers` is installed) or keyword overlap fallback.
 
+The matcher now also adds:
+
+- Nature-theme alignment scoring to keep selected clips on-topic for wildlife/nature stories.
+- Relevance and diversity scoring to reduce repetitive clip reuse when top candidates are close.
+
 Check the log panel for lines like:
 
 - `Scene 3: keywords=brain, cells, neuron | query='brain cells neuron' | chosen=pexels_12345.mp4`
@@ -88,6 +95,5 @@ Check the log panel for lines like:
 
 ## Next upgrades
 
-- Smarter semantic clip matching
-- Subtitle styling editor
 - AI music generation option
+- Automatic pipeline where folder of voiceover are added and a video is generated for each automatically. It runs every week for new ones.
