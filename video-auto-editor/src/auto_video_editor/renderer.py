@@ -24,44 +24,58 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MICRO_ZOOM_EVERY_SECONDS = 2.35
 MICRO_ZOOM_PULSE_SECONDS = 0.46
 MICRO_ZOOM_STRENGTH = 0.055
+CAPTION_IN_POP_SECONDS = 0.08
+CAPTION_OUT_FADE_SECONDS = 0.10
 
 CAPTION_STYLE_PRESETS = {
-    "beast": {
+    "bold_stroke": {
         "base_fill": (20, 20, 20, 190),
         "emphasis_fill": (30, 24, 10, 208),
         "accent": (255, 196, 0, 220),
         "emphasis_accent": (255, 223, 92, 235),
         "text": (255, 255, 255, 255),
-        "highlight": (255, 244, 179, 255),
+        "highlight": (255, 255, 255, 255),
+        "active_highlight": (255, 255, 255, 255),
         "shadow": (0, 0, 0, 90),
         "position_ratio": 0.54,
-        "pop_strength": 0.05,
+        "pop_strength": 0.0,
         "max_lines": 6,
+        "gradient_text": False,
     },
-    "clean": {
+    "yellow_active": {
         "base_fill": (14, 17, 24, 172),
         "emphasis_fill": (25, 38, 58, 188),
         "accent": (100, 197, 255, 210),
         "emphasis_accent": (146, 219, 255, 228),
         "text": (248, 251, 255, 255),
-        "highlight": (199, 237, 255, 255),
+        "highlight": (248, 251, 255, 255),
+        "active_highlight": (255, 220, 64, 255),
         "shadow": (0, 0, 0, 70),
         "position_ratio": 0.58,
-        "pop_strength": 0.03,
+        "pop_strength": 0.0,
         "max_lines": 5,
+        "gradient_text": False,
     },
-    "kinetic": {
+    "gradient_fill": {
         "base_fill": (15, 13, 19, 184),
         "emphasis_fill": (38, 15, 16, 205),
         "accent": (255, 107, 107, 218),
         "emphasis_accent": (255, 158, 158, 232),
         "text": (255, 255, 255, 255),
         "highlight": (255, 214, 163, 255),
+        "active_highlight": (255, 228, 130, 255),
         "shadow": (0, 0, 0, 100),
         "position_ratio": 0.52,
-        "pop_strength": 0.07,
+        "pop_strength": 0.0,
         "max_lines": 5,
+        "gradient_text": True,
+        "gradient_top": (255, 116, 255, 255),
+        "gradient_bottom": (102, 225, 255, 255),
     },
+    # Backward-compat aliases for existing config values.
+    "beast": {},
+    "clean": {},
+    "kinetic": {},
 }
 
 EMPHASIS_HINT_WORDS = {
@@ -177,6 +191,18 @@ def _wrap_text(
 
 def _load_caption_font(height: int, scale: float = 1.0) -> ImageFont.ImageFont:
     size = max(24, int(height * 0.03 * max(0.6, float(scale))))
+    project_root = Path(__file__).resolve().parents[2]
+    bundled = (
+        project_root / "assets" / "fonts" / "Montserrat-Bold.ttf",
+        project_root / "assets" / "fonts" / "Anton-Regular.ttf",
+    )
+    for path in bundled:
+        if path.exists():
+            try:
+                return ImageFont.truetype(str(path), size=size)
+            except Exception:
+                pass
+
     for name in ("arial.ttf", "segoeui.ttf", "calibri.ttf"):
         try:
             return ImageFont.truetype(name, size=size)
@@ -187,6 +213,18 @@ def _load_caption_font(height: int, scale: float = 1.0) -> ImageFont.ImageFont:
 
 def _load_caption_font_bold(height: int, scale: float = 1.0) -> ImageFont.ImageFont:
     size = max(26, int(height * 0.032 * max(0.6, float(scale))))
+    project_root = Path(__file__).resolve().parents[2]
+    bundled = (
+        project_root / "assets" / "fonts" / "Montserrat-Bold.ttf",
+        project_root / "assets" / "fonts" / "Anton-Regular.ttf",
+    )
+    for path in bundled:
+        if path.exists():
+            try:
+                return ImageFont.truetype(str(path), size=size)
+            except Exception:
+                pass
+
     for name in ("arialbd.ttf", "segoeuib.ttf", "calibrib.ttf"):
         try:
             return ImageFont.truetype(name, size=size)
@@ -668,6 +706,51 @@ def _make_segment_caption_fns(
     """
     line_spacing = 6
 
+    def _draw_gradient_word(
+        canvas: Image.Image,
+        text_draw: ImageDraw.ImageDraw,
+        word: str,
+        x: int,
+        y: int,
+    ) -> None:
+        # Draw stroke first, then fill glyph with a vertical gradient masked to the word shape.
+        text_draw.text(
+            (x, y),
+            word,
+            font=font,
+            fill=(255, 255, 255, 0),
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 230),
+        )
+        bbox = text_draw.textbbox((x, y), word, font=font)
+        bw = max(1, int(bbox[2] - bbox[0]))
+        bh = max(1, int(bbox[3] - bbox[1]))
+
+        gradient = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        gdraw = ImageDraw.Draw(gradient)
+        top = preset.get("gradient_top", (255, 116, 255, 255))
+        bottom = preset.get("gradient_bottom", (102, 225, 255, 255))
+        denom = max(1, bh - 1)
+        for row in range(bh):
+            mix = row / denom
+            color = (
+                int(top[0] + (bottom[0] - top[0]) * mix),
+                int(top[1] + (bottom[1] - top[1]) * mix),
+                int(top[2] + (bottom[2] - top[2]) * mix),
+                255,
+            )
+            gdraw.line((0, row, bw, row), fill=color, width=1)
+
+        mask = Image.new("L", (bw, bh), 0)
+        mdraw = ImageDraw.Draw(mask)
+        mdraw.text(
+            (-int(bbox[0] - x), -int(bbox[1] - y)),
+            word,
+            font=font,
+            fill=255,
+        )
+        canvas.paste(gradient, (int(bbox[0]), int(bbox[1])), mask)
+
     def make_caption_rgba_frame(t: float) -> np.ndarray:
         image = Image.new("RGBA", (width, box_height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -688,6 +771,7 @@ def _make_segment_caption_fns(
         text_draw = ImageDraw.Draw(text_canvas)
 
         active_idx = _active_word_index(t, word_windows) if enable_karaoke_highlight else -1
+        use_gradient_text = bool(preset.get("gradient_text", False))
         word_cursor = 0
         y = 0
         for line_words in words_by_line:
@@ -707,16 +791,19 @@ def _make_segment_caption_fns(
                 if normalized in emphasis_words:
                     fill = preset["highlight"]
                 if word_cursor == active_idx:
-                    fill = preset["highlight"]
+                    fill = preset.get("active_highlight", preset["highlight"])
 
-                text_draw.text(
-                    (x, y),
-                    word,
-                    font=font,
-                    fill=fill,
-                    stroke_width=2,
-                    stroke_fill=(0, 0, 0, 230),
-                )
+                if use_gradient_text and word_cursor != active_idx:
+                    _draw_gradient_word(text_canvas, text_draw, word, x, y)
+                else:
+                    text_draw.text(
+                        (x, y),
+                        word,
+                        font=font,
+                        fill=fill,
+                        stroke_width=2,
+                        stroke_fill=(0, 0, 0, 230),
+                    )
                 x += widths[i] + (space_w if i < len(line_words) - 1 else 0)
                 word_cursor += 1
 
@@ -759,7 +846,13 @@ def _subtitle_overlays(
     if not subtitle_plan:
         return []
 
-    preset = dict(CAPTION_STYLE_PRESETS.get(caption_style, CAPTION_STYLE_PRESETS["beast"]))
+    style_alias = {
+        "beast": "bold_stroke",
+        "clean": "yellow_active",
+        "kinetic": "gradient_fill",
+    }
+    resolved_style = style_alias.get((caption_style or "").strip().lower(), caption_style)
+    preset = dict(CAPTION_STYLE_PRESETS.get(resolved_style, CAPTION_STYLE_PRESETS["bold_stroke"]))
     if caption_position_ratio is not None:
         preset["position_ratio"] = max(0.35, min(float(caption_position_ratio), 0.85))
     if caption_max_lines is not None:
@@ -863,24 +956,41 @@ def _subtitle_overlays(
         )
         mask_clip = VideoClip(make_frame=make_caption_mask, ismask=True, duration=duration).set_start(start).set_end(end)
         clip = clip.set_mask(mask_clip)
-        clip = clip.crossfadein(0.12).crossfadeout(0.10)
-        if segment.emphasis:
-            pop = float(preset.get("pop_strength", 0.05)) * max(0.5, float(caption_pop_scale))
-            _cw, _ch, _p = int(width), int(box_height), pop
+        clip = clip.crossfadeout(CAPTION_OUT_FADE_SECONDS)
 
-            def _pop_frame(gf, t: float, cw: int = _cw, ch: int = _ch, p: float = _p) -> np.ndarray:
-                scale = 1.0 + p * math.exp(-8.0 * t)
-                if abs(scale - 1.0) < 1e-4:
-                    return gf(t)
-                new_w = max(cw, int(round(cw * scale)))
-                new_h = max(ch, int(round(ch * scale)))
-                resized = Image.fromarray(gf(t)).resize((new_w, new_h), Image.LANCZOS)
-                arr = np.array(resized)
-                y0 = (new_h - ch) // 2
-                x0 = (new_w - cw) // 2
-                return arr[y0 : y0 + ch, x0 : x0 + cw]
+        # CapCut-like caption entrance: 0.8 -> 1.0 scale over 80ms.
+        _cw, _ch = int(width), int(box_height)
 
-            clip = clip.fl(_pop_frame, keep_duration=True)
+        def _pop_in_frame(gf, t: float, cw: int = _cw, ch: int = _ch) -> np.ndarray:
+            if t >= CAPTION_IN_POP_SECONDS:
+                return gf(t)
+            ratio = max(0.0, min(1.0, t / max(1e-4, CAPTION_IN_POP_SECONDS)))
+            scale = 0.8 + (0.2 * ratio)
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            resized = Image.fromarray(gf(t)).resize((new_w, new_h), Image.LANCZOS)
+            canvas = Image.new("RGB", (cw, ch), (0, 0, 0))
+            x0 = (cw - new_w) // 2
+            y0 = (ch - new_h) // 2
+            canvas.paste(resized, (x0, y0))
+            return np.array(canvas)
+
+        def _pop_in_mask(gf, t: float, cw: int = _cw, ch: int = _ch) -> np.ndarray:
+            if t >= CAPTION_IN_POP_SECONDS:
+                return gf(t)
+            ratio = max(0.0, min(1.0, t / max(1e-4, CAPTION_IN_POP_SECONDS)))
+            scale = 0.8 + (0.2 * ratio)
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            resized = Image.fromarray((gf(t) * 255.0).astype(np.uint8)).resize((new_w, new_h), Image.LANCZOS)
+            canvas = Image.new("L", (cw, ch), 0)
+            x0 = (cw - new_w) // 2
+            y0 = (ch - new_h) // 2
+            canvas.paste(resized, (x0, y0))
+            return np.array(canvas).astype(np.float32) / 255.0
+
+        clip = clip.fl(_pop_in_frame, keep_duration=True)
+        clip = clip.set_mask(clip.mask.fl(_pop_in_mask, keep_duration=True))
         overlays.append(clip)
 
     return overlays

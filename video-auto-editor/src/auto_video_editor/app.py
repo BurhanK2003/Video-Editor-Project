@@ -23,9 +23,9 @@ TRANSITION_STYLE_MAP = {
 }
 
 CAPTION_STYLE_MAP = {
-    "Beast": "beast",
-    "Clean": "clean",
-    "Kinetic": "kinetic",
+    "Bold Stroke": "bold_stroke",
+    "Yellow Active": "yellow_active",
+    "Gradient Fill": "gradient_fill",
 }
 
 
@@ -49,7 +49,7 @@ class AutoEditorApp:
         self.allow_stock_fetch_var = tk.BooleanVar(value=True)
         self.transition_style_var = tk.StringVar(value="Crossfade")
         self.transition_duration_var = tk.DoubleVar(value=0.22)
-        self.caption_style_var = tk.StringVar(value="Beast")
+        self.caption_style_var = tk.StringVar(value="Bold Stroke")
         self.whisper_model_var = tk.StringVar(value="base")
         self.caption_position_ratio_var = tk.DoubleVar(value=0.54)
         self.caption_max_lines_var = tk.IntVar(value=3)
