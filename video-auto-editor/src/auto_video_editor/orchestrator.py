@@ -69,6 +69,12 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
         caption_pop_scale=request.caption_pop_scale,
         enable_adaptive_caption_safe_zones=request.enable_adaptive_caption_safe_zones,
         enable_karaoke_highlight=request.enable_karaoke_highlight,
+        enable_motion_overlays=request.enable_motion_overlays,
+        hook_text_override=request.hook_text_override,
+        stat_badge_text=request.stat_badge_text,
+        cta_text=request.cta_text,
+        logo_path=request.logo_path,
+        enable_progress_bar=request.enable_progress_bar,
     )
 
     report = build_export_quality_report(

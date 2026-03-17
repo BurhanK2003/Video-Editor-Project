@@ -70,3 +70,9 @@ class AutoEditRequest:
     caption_pop_scale: float = 1.0
     enable_adaptive_caption_safe_zones: bool = True
     enable_karaoke_highlight: bool = True
+    enable_motion_overlays: bool = False
+    hook_text_override: str = ""
+    stat_badge_text: str = ""
+    cta_text: str = ""
+    logo_path: Path | None = None
+    enable_progress_bar: bool = True

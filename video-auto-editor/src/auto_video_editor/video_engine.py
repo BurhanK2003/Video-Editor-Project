@@ -83,6 +83,12 @@ class VideoEngine:
             caption_pop_scale=float(config.get("caption_pop_scale", 1.0)),
             enable_adaptive_caption_safe_zones=bool(config.get("enable_adaptive_caption_safe_zones", True)),
             enable_karaoke_highlight=bool(config.get("enable_karaoke_highlight", True)),
+            enable_motion_overlays=bool(config.get("enable_motion_overlays", True)),
+            hook_text_override=str(config.get("hook_text_override", "")),
+            stat_badge_text=str(config.get("stat_badge_text", "")),
+            cta_text=str(config.get("cta_text", "Learn More")),
+            logo_path=(Path(config["logo_path"]) if config.get("logo_path") else None),
+            enable_progress_bar=bool(config.get("enable_progress_bar", True)),
         )
 
         return output_path

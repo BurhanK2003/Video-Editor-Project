@@ -16,6 +16,7 @@ from moviepy.audio.fx.all import audio_loop
 from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip, concatenate_videoclips
 
 from .models import PlannedSegment, TimelineClip, WordToken
+from .overlays import create_motion_graphics_overlays
 
 TRANSITION_STYLES = ("none", "pro_weighted")
 SEGMENT_TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
@@ -1279,6 +1280,12 @@ def render_video(
     caption_pop_scale: float = 1.0,
     enable_adaptive_caption_safe_zones: bool = True,
     enable_karaoke_highlight: bool = True,
+    enable_motion_overlays: bool = True,
+    hook_text_override: str = "",
+    stat_badge_text: str = "",
+    cta_text: str = "Learn More",
+    logo_path: Path | None = None,
+    enable_progress_bar: bool = True,
 ) -> None:
     if not timeline_clips:
         raise ValueError("No timeline clips available. Add clips in the clips folder.")
@@ -1286,6 +1293,7 @@ def render_video(
     assembled = []
     opened_video_clips: list[VideoClip] = []
     subtitle_clips: list[VideoClip] = []
+    overlay_clips: list[VideoClip] = []
     voiceover_clip: AudioClip | None = None
     music_clip: AudioFileClip | None = None
     final_video = None
@@ -1373,8 +1381,24 @@ def render_video(
             enable_karaoke_highlight=enable_karaoke_highlight,
         )
         log(f"Caption segments burned in: {len(subtitle_clips)}")
-        if subtitle_clips:
-            final_video = CompositeVideoClip([final_video, *subtitle_clips], size=(width, height))
+
+        overlay_clips = []
+        if enable_motion_overlays:
+            overlay_clips = create_motion_graphics_overlays(
+                subtitle_plan=subtitle_plan,
+                width=width,
+                height=height,
+                final_duration=final_duration,
+                hook_text_override=hook_text_override,
+                stat_badge_text=stat_badge_text,
+                cta_text=cta_text,
+                logo_path=logo_path,
+                enable_progress_bar=enable_progress_bar,
+            )
+            log(f"Motion graphic overlays: {len(overlay_clips)}")
+
+        if subtitle_clips or overlay_clips:
+            final_video = CompositeVideoClip([final_video, *subtitle_clips, *overlay_clips], size=(width, height))
 
         tracks = [voiceover_clip.volumex(1.0)]
         music_track = _pick_music_track(music_folder)
@@ -1414,6 +1438,8 @@ def render_video(
         if music_clip is not None:
             music_clip.close()
         for c in subtitle_clips:
+            c.close()
+        for c in overlay_clips:
             c.close()
         for c in opened_video_clips:
             c.close()
