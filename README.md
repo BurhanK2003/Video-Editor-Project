@@ -66,7 +66,7 @@ The app will read `PEXELS_API_KEY` and `PIXABAY_API_KEY` from the process enviro
 ## Run
 
 ```powershell
-& "E:/Personal Projects/Video-Editor-Project/.venv/Scripts/python.exe" -m src.auto_video_editor.main
+& "E:/Personal Projects/Video-Editor-Project/.venv/Scripts/python.exe" -m src.auto_video_editor.mainsssss
 ```
 
 If you leave `Clips Folder` empty, keep stock fetching enabled and optionally enter `Stock Search` keywords such as `city skyline, office, teamwork`. When local footage is missing, the app will try transcript-based searches first and download stock clips into `output/_stock_cache`.
