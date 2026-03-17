@@ -5,7 +5,7 @@ This is a local-first desktop prototype for auto-editing videos from a voiceover
 ## What it does now
 
 - Import a voiceover audio file
-- Import a local folder of video clips, or fetch stock clips from Pexels/Pixabay when local footage is missing
+- Import a local folder of video clips, or fetch stock clips from Pexels/Pixabay/Openverse when local footage is missing
 - Optionally import a music folder
 - Auto-transcribe the voiceover (if `faster-whisper` is installed and model download succeeds)
 - Build a rough cut by matching transcript segments to clips
@@ -62,6 +62,7 @@ PIXABAY_API_KEY=your_pixabay_key
 ```
 
 The app will read `PEXELS_API_KEY` and `PIXABAY_API_KEY` from the process environment or a local `.env` file in the project root.
+Openverse image search is keyless and works without API credentials.
 
 ## Run
 
@@ -90,7 +91,8 @@ Check the log panel for lines like:
 
 - First transcription run may download a model and take longer.
 - If transcription is unavailable, the app still renders using one full-length segment.
-- Pexels and Pixabay both require API keys for automated downloads.
+- Pexels and Pixabay require API keys for automated downloads.
+- Openverse image fallback does not require an API key.
 - Stock footage downloads need an internet connection and provider availability.
 
 ## Next upgrades

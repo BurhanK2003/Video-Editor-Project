@@ -425,10 +425,27 @@ def _select_best_index(
 ) -> int:
     ranked: list[tuple[float, int]] = []
     recent_window = recent_indices[-6:]
+    last_idx = recent_indices[-1] if recent_indices else None
+    recent_8 = recent_indices[-8:]
     for idx, score in enumerate(base_scores):
-        diversity_penalty = usage_count[idx] * 0.25
-        recency_penalty = 0.30 if idx in recent_window else 0.0
-        final_score = score - diversity_penalty - recency_penalty
+        diversity_penalty = usage_count[idx] * 0.32 + max(0, usage_count[idx] - 2) * 0.18
+
+        if last_idx is not None and idx == last_idx:
+            recency_penalty = 0.85
+        elif len(recent_indices) >= 2 and idx == recent_indices[-2]:
+            recency_penalty = 0.55
+        elif idx in recent_window:
+            recency_penalty = 0.30
+        else:
+            recency_penalty = 0.0
+
+        # Extra cooldown when a clip has already appeared multiple times very recently.
+        recent_hits = recent_8.count(idx)
+        streak_penalty = 0.0
+        if recent_hits >= 2:
+            streak_penalty = 0.20 * (recent_hits - 1)
+
+        final_score = score - diversity_penalty - recency_penalty - streak_penalty
         ranked.append((final_score, idx))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -436,6 +453,19 @@ def _select_best_index(
         return 0
 
     top_score, top_idx = ranked[0]
+    # Strong anti-repeat preference: if top pick is very recent and another clip is close,
+    # prefer variety unless quality would drop significantly.
+    if top_idx in recent_window:
+        for alt_score, alt_idx in ranked[1:6]:
+            if alt_idx not in recent_window and (top_score - alt_score) <= 0.28:
+                return alt_idx
+
+    # Especially avoid immediate A-A repeats unless the score gap is clearly large.
+    if last_idx is not None and top_idx == last_idx:
+        for alt_score, alt_idx in ranked[1:6]:
+            if alt_idx != last_idx and (top_score - alt_score) <= 0.36:
+                return alt_idx
+
     for alt_score, alt_idx in ranked[1:4]:
         if top_idx in recent_window and alt_idx not in recent_window and (top_score - alt_score) <= 0.16:
             return alt_idx

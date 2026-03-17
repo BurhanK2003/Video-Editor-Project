@@ -244,24 +244,44 @@ def _load_caption_font_bold(height: int, scale: float = 1.0) -> ImageFont.ImageF
     return _load_caption_font(height, scale=scale)
 
 
-def _apply_ken_burns(clip: VideoFileClip, zoom_ratio: float = 0.06) -> VideoFileClip:
-    """Slowly zoom into the clip over its duration (Ken Burns effect).
-
-    The clip is centre-cropped so the output dimensions never change.
-    *zoom_ratio* is the fractional size increase at the end (0.06 = 6%).
-    """
+def _apply_ken_burns(
+    clip: VideoClip,
+    zoom_ratio: float = 0.08,
+    pan_ratio: float = 0.08,
+    seed_key: str = "",
+) -> VideoClip:
+    """Apply a deterministic Ken Burns pan+zoom for still-image motion."""
     w, h = int(clip.w), int(clip.h)
+    digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
+
+    def _axis_pair(a: int, b: int) -> tuple[float, float]:
+        start = a / 255.0
+        end = b / 255.0
+        # Keep movement inside a safe central band to avoid edge-heavy crops.
+        margin = max(0.0, min(0.35, (1.0 - float(pan_ratio)) * 0.5))
+        start = margin + (1.0 - 2.0 * margin) * start
+        end = margin + (1.0 - 2.0 * margin) * end
+        return start, end
+
+    x_start, x_end = _axis_pair(digest[0], digest[1])
+    y_start, y_end = _axis_pair(digest[2], digest[3])
 
     def zoom_frame(gf, t: float):
-        progress = min(t / max(clip.duration, 1e-3), 1.0)
-        scale = 1.0 + zoom_ratio * progress
+        progress = min(t / max(float(clip.duration or 0.0), 1e-3), 1.0)
+        scale = 1.0 + max(0.0, float(zoom_ratio)) * progress
         frame = gf(t)
         new_w = max(w, int(round(w * scale)))
         new_h = max(h, int(round(h * scale)))
+
         resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
         arr = np.array(resized)
-        y0 = (new_h - h) // 2
-        x0 = (new_w - w) // 2
+
+        max_x = max(0, new_w - w)
+        max_y = max(0, new_h - h)
+        x_frac = x_start + (x_end - x_start) * progress
+        y_frac = y_start + (y_end - y_start) * progress
+        x0 = int(round(max(0.0, min(1.0, x_frac)) * max_x))
+        y0 = int(round(max(0.0, min(1.0, y_frac)) * max_y))
         return arr[y0 : y0 + h, x0 : x0 + w]
 
     return clip.fl(zoom_frame)
@@ -1299,10 +1319,18 @@ def render_video(
     final_video = None
 
     try:
+        image_motion_count = 0
         for shot in timeline_clips:
             needed = max(0.2, float(shot.timeline_end - shot.timeline_start))
             if shot.source_path.suffix.lower() in IMAGE_EXTENSIONS:
                 clip = ImageClip(str(shot.source_path)).set_duration(needed)
+                clip = _apply_ken_burns(
+                    clip,
+                    zoom_ratio=0.10,
+                    pan_ratio=0.10,
+                    seed_key=f"{shot.source_path.as_posix()}|{shot.timeline_start:.3f}|{shot.timeline_end:.3f}",
+                )
+                image_motion_count += 1
             else:
                 clip = VideoFileClip(str(shot.source_path))
             opened_video_clips.append(clip)
@@ -1323,6 +1351,8 @@ def render_video(
 
         if not assembled:
             raise ValueError("Failed to assemble output timeline.")
+        if image_motion_count > 0:
+            log(f"Ken Burns motion applied to {image_motion_count} image shots")
 
         voiceover_clip, subtitle_plan = _build_trimmed_voiceover(voiceover_path, subtitle_plan, log)
         subtitle_plan = _sync_plan_to_voice_energy(subtitle_plan, voiceover_clip, log)
