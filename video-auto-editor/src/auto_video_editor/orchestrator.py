@@ -33,7 +33,7 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
     )
     log(f"Transcript segments: {len(segments)}")
 
-    plan = build_plan(segments)
+    plan = build_plan(segments, log=log)
     log(f"Subtitle plan segments: {len(plan)}")
     clips = list_video_clips(request.clips_folder)
     if not clips and request.allow_stock_fetch:

@@ -510,8 +510,6 @@ class AutoEditorApp:
             enable_progress_bar=self.enable_progress_bar_var.get(),
             script_text=script_text,
             script_voice=script_voice,
-                script_text=script_text,
-                script_voice=script_voice,
         )
 
     def _start_auto_edit(self) -> None:

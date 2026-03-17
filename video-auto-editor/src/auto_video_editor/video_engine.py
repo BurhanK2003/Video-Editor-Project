@@ -53,7 +53,7 @@ class VideoEngine:
 
         model_size = str(config.get("whisper_model", "base"))
         segments = transcribe_voiceover(voiceover_path=voiceover, model_size=model_size, log=self._log)
-        plan = build_plan(segments)
+        plan = build_plan(segments, log=self._log)
         timeline = assign_clips(plan, available_clips, log=self._log)
         selected_music_track = resolve_music_track(Path(music_path) if music_path else None)
         timeline = apply_rhythm_sync(
