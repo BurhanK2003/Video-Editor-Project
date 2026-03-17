@@ -61,7 +61,7 @@ class AutoEditRequest:
     render_preset: str = "veryfast"
     allow_stock_fetch: bool = True
     stock_keywords: str = ""
-    transition_style: str = "crossfade"  # none | crossfade | zoom | fade_black
+    transition_style: str = "pro_weighted"  # none | pro_weighted
     transition_duration: float = 0.22
     caption_style: str = "beast"
     caption_position_ratio: float | None = None
@@ -70,6 +70,12 @@ class AutoEditRequest:
     caption_pop_scale: float = 1.0
     enable_adaptive_caption_safe_zones: bool = True
     enable_karaoke_highlight: bool = True
+    enable_motion_overlays: bool = False
+    hook_text_override: str = ""
+    stat_badge_text: str = ""
+    cta_text: str = ""
+    logo_path: Path | None = None
+    enable_progress_bar: bool = True
     # Script-to-video: supply a script instead of a pre-recorded voiceover.
     script_text: str = ""
     script_voice: str = ""  # edge-tts voice name, e.g. "en-US-AriaNeural"; empty = auto

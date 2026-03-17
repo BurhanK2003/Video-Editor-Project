@@ -5,6 +5,7 @@ from .models import AutoEditRequest
 from .planner import build_plan
 from .quality import build_export_quality_report, write_export_quality_report
 from .renderer import render_video
+from .rhythm import apply_rhythm_sync, resolve_music_track
 from .stock_fetcher import fetch_stock_clips
 from .transcribe import transcribe_voiceover
 
@@ -53,6 +54,13 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
     log(f"Available source clips: {len(clips)}")
 
     timeline = assign_clips(plan, clips, log=log)
+    selected_music_track = resolve_music_track(request.music_folder)
+    timeline = apply_rhythm_sync(
+        timeline=timeline,
+        voiceover_path=request.voiceover_path,
+        music_path=selected_music_track,
+        log=log,
+    )
     log(f"Timeline shots: {len(timeline)}")
 
     render_video(
@@ -64,7 +72,7 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
         height=request.output_height,
         fps=request.fps,
         render_preset=request.render_preset,
-        music_folder=request.music_folder,
+        music_folder=selected_music_track,
         log=log,
         transition_style=request.transition_style,
         transition_duration=request.transition_duration,
@@ -75,6 +83,12 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
         caption_pop_scale=request.caption_pop_scale,
         enable_adaptive_caption_safe_zones=request.enable_adaptive_caption_safe_zones,
         enable_karaoke_highlight=request.enable_karaoke_highlight,
+        enable_motion_overlays=request.enable_motion_overlays,
+        hook_text_override=request.hook_text_override,
+        stat_badge_text=request.stat_badge_text,
+        cta_text=request.cta_text,
+        logo_path=request.logo_path,
+        enable_progress_bar=request.enable_progress_bar,
     )
 
     report = build_export_quality_report(

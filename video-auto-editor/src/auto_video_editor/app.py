@@ -17,15 +17,13 @@ RENDER_SPEED_PRESETS = {
 
 TRANSITION_STYLE_MAP = {
     "None": "none",
-    "Crossfade": "crossfade",
-    "Zoom": "zoom",
-    "Fade Black": "fade_black",
+    "Professional Weighted": "pro_weighted",
 }
 
 CAPTION_STYLE_MAP = {
-    "Beast": "beast",
-    "Clean": "clean",
-    "Kinetic": "kinetic",
+    "Bold Stroke": "bold_stroke",
+    "Yellow Active": "yellow_active",
+    "Gradient Fill": "gradient_fill",
 }
 
 
@@ -34,7 +32,7 @@ class AutoEditorApp:
         self.root = root
         self.root.title("Local Auto Video Editor")
         self.root.geometry("980x700")
-        self.root.minsize(820, 560)
+        self.root.minsize(900, 620)
 
         self.voiceover_var = tk.StringVar()
         self.clips_var = tk.StringVar()
@@ -48,9 +46,9 @@ class AutoEditorApp:
         self.fps_var = tk.IntVar(value=24)
         self.render_speed_var = tk.StringVar(value="Fast")
         self.allow_stock_fetch_var = tk.BooleanVar(value=True)
-        self.transition_style_var = tk.StringVar(value="Crossfade")
+        self.transition_style_var = tk.StringVar(value="Professional Weighted")
         self.transition_duration_var = tk.DoubleVar(value=0.22)
-        self.caption_style_var = tk.StringVar(value="Beast")
+        self.caption_style_var = tk.StringVar(value="Bold Stroke")
         self.whisper_model_var = tk.StringVar(value="base")
         self.caption_position_ratio_var = tk.DoubleVar(value=0.54)
         self.caption_max_lines_var = tk.IntVar(value=3)
@@ -58,6 +56,11 @@ class AutoEditorApp:
         self.caption_pop_scale_var = tk.DoubleVar(value=1.00)
         self.adaptive_safe_zones_var = tk.BooleanVar(value=True)
         self.karaoke_highlight_var = tk.BooleanVar(value=True)
+        self.enable_motion_overlays_var = tk.BooleanVar(value=False)
+        self.stat_badge_text_var = tk.StringVar()
+        self.cta_text_var = tk.StringVar()
+        self.logo_path_var = tk.StringVar()
+        self.enable_progress_bar_var = tk.BooleanVar(value=True)
         # Script-to-video
         self.script_text_var = tk.StringVar()
         self.script_voice_var = tk.StringVar(value="en-US-AriaNeural")
@@ -98,15 +101,44 @@ class AutoEditorApp:
         canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
+        split = ttk.Panedwindow(frame, orient="vertical")
+        split.pack(fill="both", expand=True)
+
+        controls_pane = ttk.Frame(split)
+        logs_pane = ttk.Frame(split)
+        split.add(controls_pane, weight=3)
+        split.add(logs_pane, weight=2)
+
+        controls_canvas = tk.Canvas(controls_pane, highlightthickness=0)
+        controls_scrollbar = ttk.Scrollbar(
+            controls_pane, orient="vertical", command=controls_canvas.yview
+        )
+        controls_frame = ttk.Frame(controls_canvas)
+
+        controls_window = controls_canvas.create_window((0, 0), window=controls_frame, anchor="nw")
+        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        controls_canvas.pack(side="left", fill="both", expand=True)
+        controls_scrollbar.pack(side="right", fill="y")
+
+        controls_frame.bind(
+            "<Configure>",
+            lambda event: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")),
+        )
+        controls_canvas.bind(
+            "<Configure>",
+            lambda event: controls_canvas.itemconfigure(controls_window, width=event.width),
+        )
+        self._bind_mousewheel_scrolling(controls_canvas, controls_frame)
+
         self._path_row(
-            frame,
+            controls_frame,
             label="Voiceover",
             text_var=self.voiceover_var,
             browse_command=self._pick_voiceover,
         )
 
         # Script-to-video section (collapsed by default via LabelFrame).
-        script_frame = ttk.LabelFrame(frame, text="Script-to-Video  (leave Voiceover empty to use TTS)", padding=6)
+        script_frame = ttk.LabelFrame(controls_frame, text="Script-to-Video  (leave Voiceover empty to use TTS)", padding=6)
         script_frame.pack(fill="x", pady=(0, 4))
         ttk.Label(script_frame, text="Script").grid(row=0, column=0, padx=6, sticky="nw")
         self.script_text_widget = tk.Text(script_frame, height=3, wrap="word")
@@ -121,30 +153,30 @@ class AutoEditorApp:
         )
 
         self._path_row(
-            frame,
+            controls_frame,
             label="Clips Folder (optional)",
             text_var=self.clips_var,
             browse_command=self._pick_clips_folder,
         )
         self._entry_row(
-            frame,
+            controls_frame,
             label="Stock Search",
             text_var=self.stock_keywords_var,
         )
         self._path_row(
-            frame,
+            controls_frame,
             label="Music Folder",
             text_var=self.music_var,
             browse_command=self._pick_music_folder,
         )
         self._path_row(
-            frame,
+            controls_frame,
             label="Output File",
             text_var=self.output_var,
             browse_command=self._pick_output,
         )
 
-        settings = ttk.LabelFrame(frame, text="Render Settings", padding=8)
+        settings = ttk.LabelFrame(controls_frame, text="Render Settings", padding=8)
         settings.pack(fill="x", pady=(10, 8))
 
         ttk.Label(settings, text="Width").grid(row=0, column=0, padx=8, pady=6, sticky="w")
@@ -181,41 +213,41 @@ class AutoEditorApp:
         ttk.Combobox(
             settings,
             textvariable=self.transition_style_var,
-            values=["None", "Crossfade", "Zoom", "Fade Black"],
+            values=list(TRANSITION_STYLE_MAP.keys()),
             state="readonly",
-            width=12,
+            width=22,
         ).grid(row=3, column=1, padx=8, pady=6, sticky="w")
 
-        ttk.Label(settings, text="Trans. Dur (s)").grid(row=3, column=2, padx=8, pady=6, sticky="w")
-        ttk.Spinbox(
-            settings,
-            from_=0.1,
-            to=2.0,
-            increment=0.1,
-            textvariable=self.transition_duration_var,
-            width=8,
-            format="%.1f",
-        ).grid(row=3, column=3, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="Engine").grid(row=3, column=2, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="35/25/20/10/10 weighted cut mix").grid(
+            row=3, column=3, columnspan=3, padx=8, pady=6, sticky="w"
+        )
 
-        ttk.Label(settings, text="Captions").grid(row=4, column=0, padx=8, pady=6, sticky="w")
+        ttk.Label(
+            settings,
+            text="zoom punch 6f | smash 1f | whip 4f | glitch 3f | fade 2-4f",
+            foreground="grey",
+        ).grid(row=4, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w")
+
+        ttk.Label(settings, text="Captions").grid(row=5, column=0, padx=8, pady=6, sticky="w")
         ttk.Combobox(
             settings,
             textvariable=self.caption_style_var,
             values=list(CAPTION_STYLE_MAP.keys()),
             state="readonly",
             width=12,
-        ).grid(row=4, column=1, padx=8, pady=6, sticky="w")
+        ).grid(row=5, column=1, padx=8, pady=6, sticky="w")
 
-        ttk.Label(settings, text="Whisper").grid(row=4, column=2, padx=8, pady=6, sticky="w")
+        ttk.Label(settings, text="Whisper").grid(row=5, column=2, padx=8, pady=6, sticky="w")
         ttk.Combobox(
             settings,
             textvariable=self.whisper_model_var,
             values=["tiny", "base", "small", "medium", "large"],
             state="readonly",
             width=10,
-        ).grid(row=4, column=3, padx=8, pady=6, sticky="w")
+        ).grid(row=5, column=3, padx=8, pady=6, sticky="w")
 
-        subtitle_style = ttk.LabelFrame(frame, text="Subtitle Styling Editor", padding=8)
+        subtitle_style = ttk.LabelFrame(controls_frame, text="Subtitle Styling Editor", padding=8)
         subtitle_style.pack(fill="x", pady=(0, 8))
 
         ttk.Label(subtitle_style, text="Vertical Pos").grid(row=0, column=0, padx=8, pady=6, sticky="w")
@@ -274,27 +306,72 @@ class AutoEditorApp:
             variable=self.karaoke_highlight_var,
         ).grid(row=2, column=2, columnspan=2, padx=8, pady=(2, 6), sticky="w")
 
-        self.run_button = ttk.Button(frame, text="Auto Edit", command=self._start_auto_edit)
+        overlays = ttk.LabelFrame(controls_frame, text="Motion Graphics Overlays", padding=8)
+        overlays.pack(fill="x", pady=(0, 8))
+
+        ttk.Checkbutton(
+            overlays,
+            text="Enable motion graphics overlays",
+            variable=self.enable_motion_overlays_var,
+        ).grid(row=0, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Label(overlays, text="Stat Badge").grid(row=1, column=0, padx=8, pady=6, sticky="w")
+        ttk.Entry(overlays, textvariable=self.stat_badge_text_var, width=26).grid(
+            row=1, column=1, padx=8, pady=6, sticky="w"
+        )
+
+        ttk.Label(overlays, text="CTA").grid(row=1, column=2, padx=8, pady=6, sticky="w")
+        ttk.Entry(overlays, textvariable=self.cta_text_var, width=18).grid(
+            row=1, column=3, padx=8, pady=6, sticky="w"
+        )
+
+        ttk.Label(overlays, text="Logo PNG").grid(row=2, column=0, padx=8, pady=6, sticky="w")
+        ttk.Entry(overlays, textvariable=self.logo_path_var).grid(
+            row=2, column=1, columnspan=2, padx=8, pady=6, sticky="ew"
+        )
+        ttk.Button(overlays, text="Browse", command=self._pick_logo).grid(
+            row=2, column=3, padx=8, pady=6, sticky="w"
+        )
+        overlays.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            overlays,
+            text="Top progress bar",
+            variable=self.enable_progress_bar_var,
+        ).grid(row=3, column=0, columnspan=4, padx=8, pady=(2, 6), sticky="w")
+
+        self.run_button = ttk.Button(logs_pane, text="Auto Edit", command=self._start_auto_edit)
         self.run_button.pack(fill="x", pady=(8, 10))
 
-        logs_label = ttk.Label(frame, text="Pipeline Log")
+        logs_label = ttk.Label(logs_pane, text="Pipeline Log")
         logs_label.pack(anchor="w")
 
-        log_frame = ttk.Frame(frame)
+        log_frame = ttk.Frame(logs_pane)
         log_frame.pack(fill="both", expand=True)
 
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical")
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical")
         self.log_box = tk.Text(
             log_frame,
-            height=18,
+            height=14,
             wrap="word",
             state="disabled",
-            yscrollcommand=log_scroll.set,
+            yscrollcommand=log_scrollbar.set,
         )
-        log_scroll.configure(command=self.log_box.yview)
-
+        log_scrollbar.configure(command=self.log_box.yview)
         self.log_box.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
+        log_scrollbar.pack(side="right", fill="y")
+
+    def _bind_mousewheel_scrolling(self, canvas: tk.Canvas, frame: ttk.Frame) -> None:
+        def bind_children(widget: tk.Misc) -> None:
+            widget.bind("<Enter>", lambda event: self.root.bind_all("<MouseWheel>", on_mousewheel))
+            widget.bind("<Leave>", lambda event: self.root.unbind_all("<MouseWheel>"))
+            for child in widget.winfo_children():
+                bind_children(child)
+
+        def on_mousewheel(event: tk.Event) -> None:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        bind_children(frame)
 
     def _path_row(
         self,
@@ -351,6 +428,15 @@ class AutoEditorApp:
         if selected:
             self.output_var.set(selected)
 
+    def _pick_logo(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Logo PNG",
+            initialdir=str(Path.cwd()),
+            filetypes=[("PNG Image", "*.png")],
+        )
+        if selected:
+            self.logo_path_var.set(selected)
+
     def _append_log(self, message: str) -> None:
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{message}\n")
@@ -374,6 +460,8 @@ class AutoEditorApp:
         output = Path(self.output_var.get().strip())
         music_raw = self.music_var.get().strip()
         music = Path(music_raw) if music_raw else None
+        logo_raw = self.logo_path_var.get().strip()
+        logo = Path(logo_raw) if logo_raw else None
         script_text = self.script_text_widget.get("1.0", "end").strip()
         script_voice = self.script_voice_var.get().strip()
 
@@ -385,6 +473,10 @@ class AutoEditorApp:
             raise ValueError("Clips folder must exist if provided.")
         if music and (not music.exists() or not music.is_dir()):
             raise ValueError("Music folder does not exist.")
+        if logo and (not logo.exists() or not logo.is_file()):
+            raise ValueError("Logo file does not exist.")
+        if logo and logo.suffix.lower() != ".png":
+            raise ValueError("Logo must be a .png file")
         if output.suffix.lower() != ".mp4":
             raise ValueError("Output file must end with .mp4")
         if not clips_folder and not self.allow_stock_fetch_var.get():
@@ -401,9 +493,9 @@ class AutoEditorApp:
             render_preset=RENDER_SPEED_PRESETS.get(self.render_speed_var.get(), "veryfast"),
             allow_stock_fetch=self.allow_stock_fetch_var.get(),
             stock_keywords=self.stock_keywords_var.get().strip(),
-            transition_style=TRANSITION_STYLE_MAP.get(self.transition_style_var.get(), "crossfade"),
+            transition_style=TRANSITION_STYLE_MAP.get(self.transition_style_var.get(), "pro_weighted"),
             transition_duration=float(self.transition_duration_var.get()),
-            caption_style=CAPTION_STYLE_MAP.get(self.caption_style_var.get(), "beast"),
+            caption_style=CAPTION_STYLE_MAP.get(self.caption_style_var.get(), "bold_stroke"),
             whisper_model=self.whisper_model_var.get() or "base",
             caption_position_ratio=float(self.caption_position_ratio_var.get()),
             caption_max_lines=int(self.caption_max_lines_var.get()),
@@ -411,8 +503,15 @@ class AutoEditorApp:
             caption_pop_scale=float(self.caption_pop_scale_var.get()),
             enable_adaptive_caption_safe_zones=self.adaptive_safe_zones_var.get(),
             enable_karaoke_highlight=self.karaoke_highlight_var.get(),
+            enable_motion_overlays=self.enable_motion_overlays_var.get(),
+            stat_badge_text=self.stat_badge_text_var.get().strip(),
+            cta_text=self.cta_text_var.get().strip(),
+            logo_path=logo,
+            enable_progress_bar=self.enable_progress_bar_var.get(),
             script_text=script_text,
             script_voice=script_voice,
+                script_text=script_text,
+                script_voice=script_voice,
         )
 
     def _start_auto_edit(self) -> None:

@@ -1,6 +1,10 @@
-moviepy==1.0.3
+moviepy==2.2.1
+pillow==11.3.0
+numpy==2.4.3
 pydub==0.25.1
 imageio-ffmpeg==0.6.0
+faster-whisper==1.1.1
+librosa==0.11.0
 
 # --- Optional: AI upgrades (install for best quality) ---
 

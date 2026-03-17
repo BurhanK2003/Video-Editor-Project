@@ -143,6 +143,28 @@ EMOTION_WORDS = {
 }
 TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
 NATURE_THEME_TERMS = ("nature", "wildlife", "documentary", "outdoors")
+ABSTRACT_VISUAL_STOPWORDS = {
+    "forget",
+    "listen",
+    "feel",
+    "think",
+    "know",
+    "understand",
+    "remember",
+    "believe",
+    "watch",
+    "hear",
+}
+VISUAL_HINTS_BY_TOKEN = {
+    "forget": ["contemplative", "reflection", "close-up"],
+    "listen": ["listening", "headphones", "ambient"],
+    "feel": ["emotional", "slow motion"],
+    "think": ["contemplative", "portrait"],
+    "remember": ["nostalgic", "soft light"],
+    "breathe": ["deep breath", "calm", "nature walk"],
+    "calm": ["serene", "gentle motion"],
+    "focus": ["close-up", "eyes", "detail"],
+}
 NOISE_KEYWORDS = {
     "the",
     "a",
@@ -415,16 +437,27 @@ def _cinematic_query(text: str, emotion: str) -> str:
     # Keyword fallback (no LLM available).
     raw_keywords = suggest_scene_keywords(text, max_keywords=6)
     filtered: list[str] = []
+    visual_hints: list[str] = []
     for kw in raw_keywords:
         token = re.sub(r"[^a-zA-Z]+", "", kw).lower()
         if len(token) < 3 or token in NOISE_KEYWORDS:
             continue
+        if token in ABSTRACT_VISUAL_STOPWORDS:
+            visual_hints.extend(VISUAL_HINTS_BY_TOKEN.get(token, []))
+            continue
+        visual_hints.extend(VISUAL_HINTS_BY_TOKEN.get(token, []))
         filtered.append(token)
+
+    lower_text = text.lower()
+    if "listen" in lower_text and "nature" in lower_text:
+        visual_hints.extend(["person", "listening", "forest trail"])
+    if "forget" in lower_text:
+        visual_hints.extend(["contemplative", "portrait", "soft light"])
 
     # Put content-specific words first; keep nature anchors as fallback context.
     deduped: list[str] = []
     seen: set[str] = set()
-    for token in [*filtered, *NATURE_THEME_TERMS]:
+    for token in [*visual_hints, *filtered, *NATURE_THEME_TERMS]:
         if token in seen:
             continue
         seen.add(token)
