@@ -61,6 +61,9 @@ class AutoEditorApp:
         self.cta_text_var = tk.StringVar()
         self.logo_path_var = tk.StringVar()
         self.enable_progress_bar_var = tk.BooleanVar(value=True)
+        # Script-to-video
+        self.script_text_var = tk.StringVar()
+        self.script_voice_var = tk.StringVar(value="en-US-AriaNeural")
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -69,8 +72,34 @@ class AutoEditorApp:
         self._poll_log_queue()
 
     def _build_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill="both", expand=True)
+        outer = ttk.Frame(self.root, padding=8)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        frame = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        def _sync_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_canvas_window_width(event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        frame.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_canvas_window_width)
+
+        # Scroll using mouse wheel while pointer is over the editor content.
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         split = ttk.Panedwindow(frame, orient="vertical")
         split.pack(fill="both", expand=True)
@@ -107,6 +136,22 @@ class AutoEditorApp:
             text_var=self.voiceover_var,
             browse_command=self._pick_voiceover,
         )
+
+        # Script-to-video section (collapsed by default via LabelFrame).
+        script_frame = ttk.LabelFrame(controls_frame, text="Script-to-Video  (leave Voiceover empty to use TTS)", padding=6)
+        script_frame.pack(fill="x", pady=(0, 4))
+        ttk.Label(script_frame, text="Script").grid(row=0, column=0, padx=6, sticky="nw")
+        self.script_text_widget = tk.Text(script_frame, height=3, wrap="word")
+        self.script_text_widget.grid(row=0, column=1, columnspan=3, padx=6, sticky="ew")
+        script_frame.columnconfigure(1, weight=1)
+        ttk.Label(script_frame, text="Voice").grid(row=1, column=0, padx=6, pady=(4, 0), sticky="w")
+        ttk.Entry(script_frame, textvariable=self.script_voice_var, width=28).grid(
+            row=1, column=1, padx=6, pady=(4, 0), sticky="w"
+        )
+        ttk.Label(script_frame, text="e.g. en-US-GuyNeural", foreground="grey").grid(
+            row=1, column=2, padx=4, pady=(4, 0), sticky="w"
+        )
+
         self._path_row(
             controls_frame,
             label="Clips Folder (optional)",
@@ -338,7 +383,7 @@ class AutoEditorApp:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
 
-        ttk.Label(row, text=label, width=12).pack(side="left")
+        ttk.Label(row, text=label, width=20).pack(side="left")
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Button(row, text="Browse", command=browse_command).pack(side="left")
 
@@ -351,7 +396,7 @@ class AutoEditorApp:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
 
-        ttk.Label(row, text=label, width=12).pack(side="left")
+        ttk.Label(row, text=label, width=20).pack(side="left")
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True)
 
     def _pick_voiceover(self) -> None:
@@ -408,7 +453,8 @@ class AutoEditorApp:
         self.root.after(100, self._poll_log_queue)
 
     def _collect_request(self) -> AutoEditRequest:
-        voiceover = Path(self.voiceover_var.get().strip())
+        voiceover_raw = self.voiceover_var.get().strip()
+        voiceover = Path(voiceover_raw) if voiceover_raw else None
         clips_raw = self.clips_var.get().strip()
         clips_folder = Path(clips_raw) if clips_raw else None
         output = Path(self.output_var.get().strip())
@@ -416,9 +462,13 @@ class AutoEditorApp:
         music = Path(music_raw) if music_raw else None
         logo_raw = self.logo_path_var.get().strip()
         logo = Path(logo_raw) if logo_raw else None
+        script_text = self.script_text_widget.get("1.0", "end").strip()
+        script_voice = self.script_voice_var.get().strip()
 
-        if not voiceover.exists() or not voiceover.is_file():
-            raise ValueError("Voiceover file is required and must exist.")
+        if not script_text and (not voiceover or not voiceover.exists() or not voiceover.is_file()):
+            raise ValueError("Provide a Voiceover file OR paste a Script for TTS.")
+        if voiceover and voiceover_raw and (not voiceover.exists() or not voiceover.is_file()):
+            raise ValueError("Voiceover file does not exist.")
         if clips_folder and (not clips_folder.exists() or not clips_folder.is_dir()):
             raise ValueError("Clips folder must exist if provided.")
         if music and (not music.exists() or not music.is_dir()):
@@ -433,7 +483,7 @@ class AutoEditorApp:
             raise ValueError("Provide a clips folder or enable stock footage fetching.")
 
         return AutoEditRequest(
-            voiceover_path=voiceover,
+            voiceover_path=voiceover or Path(""),
             clips_folder=clips_folder,
             output_path=output,
             music_folder=music,
@@ -458,6 +508,10 @@ class AutoEditorApp:
             cta_text=self.cta_text_var.get().strip(),
             logo_path=logo,
             enable_progress_bar=self.enable_progress_bar_var.get(),
+            script_text=script_text,
+            script_voice=script_voice,
+                script_text=script_text,
+                script_voice=script_voice,
         )
 
     def _start_auto_edit(self) -> None:

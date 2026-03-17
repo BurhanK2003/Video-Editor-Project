@@ -6,3 +6,32 @@ imageio-ffmpeg==0.6.0
 faster-whisper==1.1.1
 librosa==0.11.0
 
+# --- Optional: AI upgrades (install for best quality) ---
+
+# CLIP visual B-roll matching — matches actual video frames to scene descriptions.
+# pip install transformers torch
+# transformers
+# torch
+
+# Sentence-transformer text matching (fallback when CLIP is unavailable).
+# pip install sentence-transformers
+# sentence-transformers
+
+# Faster Whisper transcription (better accuracy & speed than base whisper).
+# pip install faster-whisper
+# faster-whisper
+
+# --- Optional: Free TTS for script-to-video ---
+
+# Kokoro ONNX — best local TTS, no internet required.
+# pip install kokoro-onnx soundfile
+# kokoro-onnx
+# soundfile
+
+# Edge TTS — Microsoft neural voices, free, internet required, no API key.
+# pip install edge-tts
+# edge-tts
+
+# pyttsx3 — fully offline fallback, lower quality.
+# pip install pyttsx3
+# pyttsx3

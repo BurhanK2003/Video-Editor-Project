@@ -220,6 +220,178 @@ def _lexical_similarity(a: str, b: str) -> float:
     return intersection / max(1, union)
 
 
+def _load_clip_backend(log: callable | None):
+    """Load CLIP for actual frame-level visual matching (best quality, free, local).
+
+    Returns (model, processor) or (None, None) if unavailable.
+    Requires: pip install transformers torch
+    """
+    try:
+        from transformers import CLIPModel, CLIPProcessor
+        import torch  # noqa: F401
+    except ImportError:
+        if log:
+            log("CLIP backend unavailable (pip install transformers torch to enable).")
+        return None, None
+
+    try:
+        model_name = "openai/clip-vit-base-patch32"
+        if log:
+            log(f"Loading CLIP visual matcher: {model_name}")
+        processor = CLIPProcessor.from_pretrained(model_name)
+        model = CLIPModel.from_pretrained(model_name)
+        model.eval()
+        if log:
+            log("CLIP visual matcher ready — matching frames to scene descriptions.")
+        return model, processor
+    except Exception as exc:
+        if log:
+            log(f"CLIP load failed ({exc}). Falling back to sentence-transformers.")
+        return None, None
+
+
+def _sample_keyframes(path: Path, n: int = 3) -> "list[np.ndarray]":
+    """Sample n evenly-spaced frames from a video, or return the image itself."""
+    import numpy as np
+    frames: list[np.ndarray] = []
+    try:
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            from PIL import Image
+            frames.append(np.array(Image.open(str(path)).convert("RGB")))
+            return frames
+        from moviepy.editor import VideoFileClip
+        with VideoFileClip(str(path)) as vc:
+            dur = float(vc.duration or 0.0)
+            if dur <= 0:
+                return frames
+            # Sample at 25%, 50%, 75% (or fewer if clip is very short).
+            positions = [dur * frac for frac in [0.25, 0.50, 0.75][:n]]
+            for t in positions:
+                t = max(0.0, min(t, dur - 0.05))
+                try:
+                    frames.append(vc.get_frame(t))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return frames
+
+
+def _build_clip_image_embedding(model, processor, path: Path, cache_dir: Path) -> "np.ndarray | None":
+    """
+    CLIP image embedding for a clip, averaged over multiple keyframes.
+    Cache key includes both file size and mtime so stale entries are never used.
+    Uses model submodules directly to stay compatible across all transformers versions.
+    """
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        stat = path.stat()
+        cache_key = f"{path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
+    except Exception:
+        cache_key = path.stem
+    cache_file = cache_dir / f"{cache_key}.npy"
+
+    if cache_file.exists():
+        try:
+            return np.load(str(cache_file))
+        except Exception:
+            cache_file.unlink(missing_ok=True)
+
+    raw_frames = _sample_keyframes(path, n=3)
+    if not raw_frames:
+        return None
+
+    vecs: list[np.ndarray] = []
+    for frame in raw_frames:
+        try:
+            pil_img = Image.fromarray(frame)
+            pixel_values = processor(images=pil_img, return_tensors="pt").pixel_values
+            with torch.no_grad():
+                vision_out = model.vision_model(pixel_values=pixel_values)
+                feat = model.visual_projection(vision_out.pooler_output)
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+            vecs.append(feat[0].cpu().numpy())
+        except Exception:
+            continue
+
+    if not vecs:
+        return None
+
+    # Average embeddings across frames, then re-normalise.
+    mean_vec = np.mean(vecs, axis=0)
+    norm = float(np.linalg.norm(mean_vec))
+    if norm > 1e-6:
+        mean_vec = mean_vec / norm
+
+    np.save(str(cache_file), mean_vec)
+    return mean_vec
+
+
+def _precompute_clip_embeddings(
+    model,
+    processor,
+    clip_paths: list[Path],
+    cache_dir: Path,
+    log: callable | None,
+) -> "list[np.ndarray | None]":
+    """Encode all clip images once before the matching loop — much faster than per-scene."""
+    embeddings: list = []
+    cached = missed = 0
+    for path in clip_paths:
+        vec = _build_clip_image_embedding(model, processor, path, cache_dir)
+        embeddings.append(vec)
+        if vec is not None:
+            cached += 1
+        else:
+            missed += 1
+    if log:
+        log(f"CLIP clip embeddings: {cached} encoded, {missed} failed/skipped")
+    return embeddings
+
+
+def _clip_text_embedding(model, processor, text: str) -> "np.ndarray | None":
+    """
+    Encode a scene query as a CLIP text embedding.
+    Uses model submodules directly to stay compatible across all transformers versions.
+    """
+    import numpy as np
+    import torch
+    try:
+        tokens = processor(
+            text=[text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=77,
+        )
+        with torch.no_grad():
+            text_out = model.text_model(
+                input_ids=tokens["input_ids"],
+                attention_mask=tokens.get("attention_mask"),
+            )
+            feat = model.text_projection(text_out.pooler_output)
+            feat = feat / feat.norm(dim=-1, keepdim=True)
+        return feat[0].cpu().numpy()
+    except Exception:
+        return None
+
+
+def _clip_scores_from_embeddings(
+    text_vec: "np.ndarray",
+    clip_embeddings: "list[np.ndarray | None]",
+) -> list[float]:
+    """Dot-product text vec against pre-computed clip vecs. Returns raw cosine similarities."""
+    import numpy as np
+    scores: list[float] = []
+    for img_vec in clip_embeddings:
+        scores.append(float(np.dot(text_vec, img_vec)) if img_vec is not None else 0.0)
+    return scores
+
+
 def _load_embedding_backend(log: callable | None):
     try:
         from sentence_transformers import SentenceTransformer
@@ -358,7 +530,30 @@ def assign_clips(
         return []
 
     clip_descriptions = [_clip_description(path) for path in clip_paths]
-    embedder = _load_embedding_backend(log)
+
+    # Resolve cache dir relative to the project root (parent of any clips folder).
+    clip_cache_dir = clip_paths[0].parent / "_clip_cache"
+
+    # Tier 1: CLIP visual matching — encode all clip frames once, then per-scene
+    # just encode the text and dot-product. No per-scene video I/O.
+    clip_model, clip_processor = _load_clip_backend(log)
+    clip_embeddings: list = []
+    if clip_model is not None:
+        clip_embeddings = _precompute_clip_embeddings(
+            clip_model, clip_processor, clip_paths, clip_cache_dir, log
+        )
+
+    # Tier 2: sentence-transformers text embedding (fallback when CLIP unavailable).
+    embedder = None if clip_model is not None else _load_embedding_backend(log)
+
+    if clip_model is not None:
+        backend = "clip"
+    elif embedder is not None:
+        backend = "sentence-transformers"
+    else:
+        backend = "keyword"
+    if log:
+        log(f"B-roll matching backend: {backend}")
 
     timeline: list[TimelineClip] = []
     usage_count = [0 for _ in clip_paths]
@@ -368,17 +563,33 @@ def assign_clips(
     for scene_idx, (segment, pidx) in enumerate(zip(visual_plan, plan_indices), start=1):
         scene_text = (segment.text or "").strip() or "voiceover"
         scene_query = (segment.visual_query or "").strip() or _scene_query(scene_text)
-        if embedder is not None:
-            scores = _semantic_scores(embedder, scene_query, clip_descriptions)
-        else:
-            scores = [_lexical_similarity(scene_query, clip_text) for clip_text in clip_descriptions]
 
+        if clip_model is not None:
+            text_vec = _clip_text_embedding(clip_model, clip_processor, scene_query)
+            if text_vec is not None:
+                base_scores = _clip_scores_from_embeddings(text_vec, clip_embeddings)
+            else:
+                base_scores = [0.0] * len(clip_paths)
+
+            # CLIP cosine sims sit in ~0.15–0.35. Scale them to ~0–1 so metadata
+            # bonuses (each capped at 0.35) don't completely dominate.
+            min_s = min(base_scores) if base_scores else 0.0
+            max_s = max(base_scores) if base_scores else 1.0
+            spread = max(max_s - min_s, 1e-6)
+            base_scores = [(s - min_s) / spread for s in base_scores]
+
+        elif embedder is not None:
+            base_scores = _semantic_scores(embedder, scene_query, clip_descriptions)
+        else:
+            base_scores = [_lexical_similarity(scene_query, desc) for desc in clip_descriptions]
+
+        # Blend normalised visual score with lightweight metadata signals.
         scores = [
             base
-            + _movement_score(desc)
-            + _keyword_relevance_score(scene_query, desc)
-            + _theme_alignment_score(scene_query, desc)
-            for base, desc in zip(scores, clip_descriptions)
+            + _movement_score(desc) * 0.4
+            + _keyword_relevance_score(scene_query, desc) * 0.4
+            + _theme_alignment_score(scene_query, desc) * 0.4
+            for base, desc in zip(base_scores, clip_descriptions)
         ]
 
         chosen_idx = _select_best_index(scores, usage_count, recent_indices)
@@ -388,8 +599,10 @@ def assign_clips(
 
         if log:
             keywords = suggest_scene_keywords(scene_text)
+            score_str = f"{scores[chosen_idx]:.3f}" if scores else "?"
             log(
-                f"Scene {scene_idx}: keywords={', '.join(keywords)} | "
+                f"Scene {scene_idx}: [{backend}={score_str}] "
+                f"keywords={', '.join(keywords)} | "
                 f"query='{scene_query}' | emotion={segment.emotion} | chosen={clip_path.name}"
             )
 

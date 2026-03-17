@@ -76,3 +76,6 @@ class AutoEditRequest:
     cta_text: str = ""
     logo_path: Path | None = None
     enable_progress_bar: bool = True
+    # Script-to-video: supply a script instead of a pre-recorded voiceover.
+    script_text: str = ""
+    script_voice: str = ""  # edge-tts voice name, e.g. "en-US-AriaNeural"; empty = auto
