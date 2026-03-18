@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .matcher import assign_clips, list_video_clips
+from .matcher import assign_clips, find_low_confidence_segments, list_video_clips
 from .models import AutoEditRequest
 from .planner import build_plan
 from .quality import build_export_quality_report, write_export_quality_report
@@ -35,23 +35,52 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
 
     plan = build_plan(segments, log=log)
     log(f"Subtitle plan segments: {len(plan)}")
-    clips = list_video_clips(request.clips_folder)
-    if not clips and request.allow_stock_fetch:
-        log("No local clips found. Attempting stock footage download.")
-        clips = fetch_stock_clips(
-            plan=plan,
-            output_path=request.output_path,
-            width=request.output_width,
-            height=request.output_height,
-            keywords_override=request.stock_keywords,
-            log=log,
-        )
+    local_clips = list_video_clips(request.clips_folder)
+    clips = list(local_clips)
+    if request.allow_stock_fetch:
+        stock_plan = plan
+        if local_clips:
+            log(f"Local source clips found: {len(local_clips)}. Checking local scene coverage before stock download.")
+            stock_plan = find_low_confidence_segments(
+                plan=plan,
+                clip_paths=local_clips,
+                log=log,
+                min_best_score=0.60,
+                max_segments=10,
+            )
+            if stock_plan:
+                log(f"Local pool looks weak for {len(stock_plan)} scenes. Fetching targeted stock for those scenes.")
+            else:
+                log("Local pool already matches planned scenes well. Skipping stock download.")
+        else:
+            log("No local clips found. Attempting stock footage download.")
+
+        if stock_plan:
+            stock_clips = fetch_stock_clips(
+                plan=stock_plan,
+                output_path=request.output_path,
+                width=request.output_width,
+                height=request.output_height,
+                keywords_override=request.stock_keywords,
+                log=log,
+            )
+            if stock_clips:
+                seen = {p.resolve() for p in clips}
+                appended = 0
+                for path in stock_clips:
+                    resolved = path.resolve()
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    clips.append(path)
+                    appended += 1
+                log(f"Stock clips downloaded and merged: {appended}")
     if not clips:
         raise ValueError(
-            "No video clips found locally, and no stock clips could be fetched. "
-            "Add local clips or set PEXELS_API_KEY / PIXABAY_API_KEY in the environment or a .env file."
+            "No source clips available: no local clips were found and stock clips could not be fetched. "
+            "Add local clips, enable stock fetch, and optionally set PEXELS_API_KEY / PIXABAY_API_KEY in .env."
         )
-    log(f"Available source clips: {len(clips)}")
+    log(f"Available source clips for matching: {len(clips)}")
 
     timeline = assign_clips(plan, clips, log=log)
     selected_music_track = resolve_music_track(request.music_folder)

@@ -6,6 +6,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from .batch_runner import run_batch_auto_edit
 from .models import AutoEditRequest
 from .orchestrator import run_auto_edit
 
@@ -61,6 +62,9 @@ class AutoEditorApp:
         self.cta_text_var = tk.StringVar()
         self.logo_path_var = tk.StringVar()
         self.enable_progress_bar_var = tk.BooleanVar(value=True)
+        self.batch_voiceovers_var = tk.StringVar()
+        self.batch_manifest_var = tk.StringVar()
+        self.batch_output_var = tk.StringVar(value=str((Path.cwd() / "output" / "batch").resolve()))
         # Script-to-video
         self.script_text_var = tk.StringVar()
         self.script_voice_var = tk.StringVar(value="en-US-AriaNeural")
@@ -176,6 +180,33 @@ class AutoEditorApp:
             browse_command=self._pick_output,
         )
 
+        batch = ttk.LabelFrame(controls_frame, text="Batch Mode", padding=8)
+        batch.pack(fill="x", pady=(0, 8))
+
+        self._path_row(
+            batch,
+            label="Voiceovers Folder",
+            text_var=self.batch_voiceovers_var,
+            browse_command=self._pick_batch_voiceovers_folder,
+        )
+        self._path_row(
+            batch,
+            label="Manifest CSV (opt)",
+            text_var=self.batch_manifest_var,
+            browse_command=self._pick_batch_manifest,
+        )
+        self._path_row(
+            batch,
+            label="Batch Output",
+            text_var=self.batch_output_var,
+            browse_command=self._pick_batch_output_folder,
+        )
+        ttk.Label(
+            batch,
+            text="CSV columns: voiceover/filename, title, keywords, caption_style, transition_style",
+            foreground="grey",
+        ).pack(anchor="w", padx=4, pady=(2, 4))
+
         settings = ttk.LabelFrame(controls_frame, text="Render Settings", padding=8)
         settings.pack(fill="x", pady=(10, 8))
 
@@ -205,7 +236,7 @@ class AutoEditorApp:
 
         ttk.Checkbutton(
             settings,
-            text="Fetch stock clips from Pexels/Pixabay if local clips are missing",
+            text="Fetch stock clips only for weak local matches, then match local + stock",
             variable=self.allow_stock_fetch_var,
         ).grid(row=2, column=0, columnspan=6, padx=8, pady=(2, 6), sticky="w")
 
@@ -343,6 +374,9 @@ class AutoEditorApp:
         self.run_button = ttk.Button(logs_pane, text="Auto Edit", command=self._start_auto_edit)
         self.run_button.pack(fill="x", pady=(8, 10))
 
+        self.batch_button = ttk.Button(logs_pane, text="Batch Auto Edit", command=self._start_batch_auto_edit)
+        self.batch_button.pack(fill="x", pady=(0, 10))
+
         logs_label = ttk.Label(logs_pane, text="Pipeline Log")
         logs_label.pack(anchor="w")
 
@@ -427,6 +461,25 @@ class AutoEditorApp:
         )
         if selected:
             self.output_var.set(selected)
+
+    def _pick_batch_voiceovers_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select Voiceovers Folder", initialdir=str(Path.cwd()))
+        if selected:
+            self.batch_voiceovers_var.set(selected)
+
+    def _pick_batch_manifest(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Batch Manifest CSV",
+            initialdir=str(Path.cwd()),
+            filetypes=[("CSV Files", "*.csv")],
+        )
+        if selected:
+            self.batch_manifest_var.set(selected)
+
+    def _pick_batch_output_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select Batch Output Folder", initialdir=str(Path.cwd()))
+        if selected:
+            self.batch_output_var.set(selected)
 
     def _pick_logo(self) -> None:
         selected = filedialog.askopenfilename(
@@ -539,13 +592,131 @@ class AutoEditorApp:
         self._worker_thread = threading.Thread(target=worker, daemon=True)
         self._worker_thread.start()
 
+    def _collect_batch_base_request(self) -> AutoEditRequest:
+        clips_raw = self.clips_var.get().strip()
+        clips_folder = Path(clips_raw) if clips_raw else None
+        music_raw = self.music_var.get().strip()
+        music = Path(music_raw) if music_raw else None
+        logo_raw = self.logo_path_var.get().strip()
+        logo = Path(logo_raw) if logo_raw else None
+
+        if clips_folder and (not clips_folder.exists() or not clips_folder.is_dir()):
+            raise ValueError("Clips folder must exist if provided.")
+        if music and (not music.exists() or not music.is_dir()):
+            raise ValueError("Music folder does not exist.")
+        if logo and (not logo.exists() or not logo.is_file()):
+            raise ValueError("Logo file does not exist.")
+        if logo and logo.suffix.lower() != ".png":
+            raise ValueError("Logo must be a .png file")
+        if not clips_folder and not self.allow_stock_fetch_var.get():
+            raise ValueError("Provide a clips folder or enable stock footage fetching.")
+
+        return AutoEditRequest(
+            voiceover_path=Path(""),
+            clips_folder=clips_folder,
+            output_path=Path("output/batch_placeholder.mp4"),
+            music_folder=music,
+            output_width=self.width_var.get(),
+            output_height=self.height_var.get(),
+            fps=self.fps_var.get(),
+            render_preset=RENDER_SPEED_PRESETS.get(self.render_speed_var.get(), "veryfast"),
+            allow_stock_fetch=self.allow_stock_fetch_var.get(),
+            stock_keywords=self.stock_keywords_var.get().strip(),
+            transition_style=TRANSITION_STYLE_MAP.get(self.transition_style_var.get(), "pro_weighted"),
+            transition_duration=float(self.transition_duration_var.get()),
+            caption_style=CAPTION_STYLE_MAP.get(self.caption_style_var.get(), "bold_stroke"),
+            whisper_model=self.whisper_model_var.get() or "base",
+            caption_position_ratio=float(self.caption_position_ratio_var.get()),
+            caption_max_lines=int(self.caption_max_lines_var.get()),
+            caption_font_scale=float(self.caption_font_scale_var.get()),
+            caption_pop_scale=float(self.caption_pop_scale_var.get()),
+            enable_adaptive_caption_safe_zones=self.adaptive_safe_zones_var.get(),
+            enable_karaoke_highlight=self.karaoke_highlight_var.get(),
+            enable_motion_overlays=self.enable_motion_overlays_var.get(),
+            stat_badge_text=self.stat_badge_text_var.get().strip(),
+            cta_text=self.cta_text_var.get().strip(),
+            logo_path=logo,
+            enable_progress_bar=self.enable_progress_bar_var.get(),
+            script_text="",
+            script_voice="",
+        )
+
+    def _start_batch_auto_edit(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showinfo("In Progress", "A render job is already running.")
+            return
+
+        voiceovers_raw = self.batch_voiceovers_var.get().strip()
+        output_raw = self.batch_output_var.get().strip()
+        manifest_raw = self.batch_manifest_var.get().strip()
+        if not voiceovers_raw:
+            messagebox.showwarning("Invalid Input", "Select a Voiceovers Folder for batch mode.")
+            return
+        if not output_raw:
+            messagebox.showwarning("Invalid Input", "Select a Batch Output folder.")
+            return
+
+        voiceovers_folder = Path(voiceovers_raw)
+        output_folder = Path(output_raw)
+        manifest_path = Path(manifest_raw) if manifest_raw else None
+
+        if not voiceovers_folder.exists() or not voiceovers_folder.is_dir():
+            messagebox.showwarning("Invalid Input", "Voiceovers Folder does not exist.")
+            return
+        if manifest_path and (not manifest_path.exists() or not manifest_path.is_file()):
+            messagebox.showwarning("Invalid Input", "Manifest CSV file does not exist.")
+            return
+
+        try:
+            base_request = self._collect_batch_base_request()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Input", str(exc))
+            return
+
+        self.run_button.configure(state="disabled")
+        self.batch_button.configure(state="disabled")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self._append_log("Starting batch pipeline...")
+
+        def worker() -> None:
+            try:
+                summary = run_batch_auto_edit(
+                    base_request=base_request,
+                    voiceovers_folder=voiceovers_folder,
+                    output_folder=output_folder,
+                    manifest_path=manifest_path,
+                    log=lambda msg: self._log_queue.put(msg),
+                )
+                self.root.after(0, self._on_batch_success, summary, str(output_folder))
+            except Exception as exc:
+                self.root.after(0, self._on_error, str(exc))
+
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
+
     def _on_success(self, output_path: str) -> None:
         self.run_button.configure(state="normal")
+        self.batch_button.configure(state="normal")
         self._append_log("Done.")
         messagebox.showinfo("Export Complete", f"Output saved to:\n{output_path}")
 
+    def _on_batch_success(self, summary: dict[str, int], output_folder: str) -> None:
+        self.run_button.configure(state="normal")
+        self.batch_button.configure(state="normal")
+        self._append_log("Batch done.")
+        messagebox.showinfo(
+            "Batch Complete",
+            f"Output folder: {output_folder}\n"
+            f"Total: {summary.get('total', 0)}\n"
+            f"Success: {summary.get('success', 0)}\n"
+            f"Failed: {summary.get('failed', 0)}",
+        )
+
     def _on_error(self, error: str) -> None:
         self.run_button.configure(state="normal")
+        self.batch_button.configure(state="normal")
         self._append_log(f"Error: {error}")
         messagebox.showerror("Auto Edit Failed", error)
 
