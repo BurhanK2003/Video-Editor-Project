@@ -83,7 +83,11 @@ def run_auto_edit(request: AutoEditRequest, log: callable) -> None:
     log(f"Available source clips for matching: {len(clips)}")
 
     timeline = assign_clips(plan, clips, log=log)
-    selected_music_track = resolve_music_track(request.music_folder)
+    selected_music_track = resolve_music_track(
+        request.music_folder,
+        voiceover_path=voiceover_path,
+        log=log,
+    )
     timeline = apply_rhythm_sync(
         timeline=timeline,
         voiceover_path=request.voiceover_path,

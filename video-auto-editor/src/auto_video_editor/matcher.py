@@ -93,6 +93,30 @@ STOP_WORDS = {
     "go",
     "or",
     "if",
+    "when",
+    "then",
+    "every",
+    "everything",
+    "something",
+    "anything",
+    "nothing",
+    "fact",
+    "facts",
+    "certainly",
+    "maybe",
+    "perhaps",
+    "word",
+    "words",
+    "speak",
+    "speaks",
+    "doesnt",
+    "dont",
+    "didnt",
+    "cant",
+    "couldnt",
+    "wont",
+    "wouldnt",
+    "shouldnt",
 }
 NATURE_TERMS = {
     "nature",
@@ -136,7 +160,7 @@ def suggest_scene_keywords(text: str, max_keywords: int = 4) -> list[str]:
     words = re.findall(r"[a-zA-Z']+", text.lower())
     filtered = [w for w in words if len(w) > 2 and w not in STOP_WORDS]
     if not filtered:
-        return ["storytelling"]
+        return []
 
     frequency: dict[str, int] = {}
     for word in filtered:

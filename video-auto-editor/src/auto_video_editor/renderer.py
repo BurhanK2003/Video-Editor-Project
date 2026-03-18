@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from moviepy.audio.AudioClip import AudioClip
 from moviepy.audio.AudioClip import CompositeAudioClip
 from moviepy.audio.AudioClip import concatenate_audioclips
-from moviepy.audio.fx.all import audio_loop
+from moviepy.audio.fx.all import audio_fadein, audio_fadeout, audio_loop
 from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip, concatenate_videoclips
 
 from .models import PlannedSegment, TimelineClip, WordToken
@@ -33,6 +33,12 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MICRO_ZOOM_EVERY_SECONDS = 2.35
 MICRO_ZOOM_PULSE_SECONDS = 0.46
 MICRO_ZOOM_STRENGTH = 0.055
+MUSIC_BASE_GAIN = 0.12
+MUSIC_DUCKED_GAIN = 0.045
+MUSIC_MAX_VOICE_RATIO = 0.28
+MUSIC_ENVELOPE_STEP_SECONDS = 0.08
+MUSIC_FADE_IN_SECONDS = 0.85
+MUSIC_FADE_OUT_SECONDS = 1.10
 CAPTION_IN_POP_SECONDS = 0.08
 CAPTION_OUT_FADE_SECONDS = 0.10
 
@@ -43,8 +49,8 @@ CAPTION_STYLE_PRESETS = {
         "accent": (255, 196, 0, 220),
         "emphasis_accent": (255, 223, 92, 235),
         "text": (255, 255, 255, 255),
-        "highlight": (255, 255, 255, 255),
-        "active_highlight": (255, 255, 255, 255),
+        "highlight": (255, 238, 170, 255),
+        "active_highlight": (255, 220, 64, 255),
         "shadow": (0, 0, 0, 90),
         "position_ratio": 0.54,
         "pop_strength": 0.0,
@@ -159,6 +165,52 @@ def _apply_micro_zooms(
     return clip.fl(_zoom_frame, keep_duration=True)
 
 
+def _deterministic_unit_interval(seed_key: str) -> float:
+    digest = hashlib.sha1(seed_key.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def _micro_zoom_params_for_shot(shot: TimelineClip) -> tuple[bool, float, float, float]:
+    shot_duration = max(0.0, float(shot.timeline_end - shot.timeline_start))
+    if shot_duration < 1.15:
+        return False, MICRO_ZOOM_EVERY_SECONDS, MICRO_ZOOM_PULSE_SECONDS, MICRO_ZOOM_STRENGTH
+
+    key_base = f"{shot.source_path.as_posix()}|{shot.plan_idx}|{shot.timeline_start:.3f}|{shot.timeline_end:.3f}"
+    include_roll = _deterministic_unit_interval(f"include|{key_base}")
+    cycle_roll = _deterministic_unit_interval(f"cycle|{key_base}")
+    strength_roll = _deterministic_unit_interval(f"strength|{key_base}")
+
+    include_probability = 0.52
+    if shot.emotion == "excitement":
+        include_probability = 0.72
+    elif shot.emotion == "suspense":
+        include_probability = 0.43
+
+    if shot.transition_type in {"whip", "zoom_in"}:
+        include_probability += 0.10
+    elif shot.transition_type == "fade":
+        include_probability -= 0.18
+
+    include_probability = max(0.25, min(0.82, include_probability))
+    if include_roll > include_probability:
+        return False, MICRO_ZOOM_EVERY_SECONDS, MICRO_ZOOM_PULSE_SECONDS, MICRO_ZOOM_STRENGTH
+
+    cycle = MICRO_ZOOM_EVERY_SECONDS * (0.9 + 0.45 * cycle_roll)
+    pulse_seconds = min(0.40, max(0.22, cycle * 0.18))
+
+    strength_base = MICRO_ZOOM_STRENGTH
+    if shot.emotion == "suspense":
+        strength_base *= 0.75
+    elif shot.emotion == "excitement":
+        strength_base *= 1.10
+    if shot.transition_type == "fade":
+        strength_base *= 0.72
+
+    strength = strength_base * (0.85 + 0.30 * strength_roll)
+    strength = max(0.028, min(0.060, strength))
+    return True, cycle, pulse_seconds, strength
+
+
 def _pick_music_track(music_folder: Path | None) -> Path | None:
     if not music_folder or not music_folder.exists():
         return None
@@ -172,6 +224,131 @@ def _pick_music_track(music_folder: Path | None) -> Path | None:
     if not tracks:
         return None
     return random.choice(tracks)
+
+
+def _clip_rms_profile(clip: AudioClip, duration: float, step: float) -> list[float]:
+    if clip is None or duration <= 0:
+        return []
+    samples = max(4, int(math.ceil(duration / max(0.03, step))))
+    values: list[float] = []
+    for i in range(samples + 1):
+        t = min(duration, i * step)
+        try:
+            frame = np.array(clip.get_frame(t), dtype=np.float32)
+        except Exception:
+            values.append(0.0)
+            continue
+        if frame.ndim > 0:
+            frame = np.abs(frame)
+            amp = float(np.mean(frame))
+        else:
+            amp = abs(float(frame))
+        values.append(max(0.0, amp))
+    return values
+
+
+def _smooth_series(values: list[float], radius: int = 2) -> list[float]:
+    if not values:
+        return values
+    smoothed: list[float] = []
+    n = len(values)
+    for idx in range(n):
+        lo = max(0, idx - radius)
+        hi = min(n, idx + radius + 1)
+        window = values[lo:hi]
+        smoothed.append(float(sum(window)) / max(1, len(window)))
+    return smoothed
+
+
+def _series_at(values: list[float], t: float, step: float) -> float:
+    if not values:
+        return 0.0
+    pos = max(0.0, float(t) / max(1e-6, step))
+    lo = int(math.floor(pos))
+    hi = min(len(values) - 1, lo + 1)
+    if lo >= len(values) - 1:
+        return float(values[-1])
+    frac = pos - lo
+    return float(values[lo] * (1.0 - frac) + values[hi] * frac)
+
+
+def _adaptive_music_mix(
+    music_clip: AudioClip,
+    voiceover_clip: AudioClip,
+    final_duration: float,
+) -> tuple[AudioClip, dict[str, float]]:
+    voice_env = _clip_rms_profile(voiceover_clip, final_duration, MUSIC_ENVELOPE_STEP_SECONDS)
+    music_env = _clip_rms_profile(music_clip, final_duration, MUSIC_ENVELOPE_STEP_SECONDS)
+    if not voice_env or not music_env:
+        mixed = music_clip.volumex(MUSIC_BASE_GAIN)
+        return mixed, {
+            "base_gain": MUSIC_BASE_GAIN,
+            "duck_gain": MUSIC_DUCKED_GAIN,
+            "voice_median": 0.0,
+            "music_median": 0.0,
+        }
+
+    voice_s = _smooth_series(voice_env, radius=2)
+    music_s = _smooth_series(music_env, radius=2)
+
+    voice_median = float(np.median(voice_s))
+    voice_p90 = float(np.percentile(voice_s, 90)) if voice_s else voice_median
+    music_median = float(np.median(music_s))
+
+    base_gain = float(MUSIC_BASE_GAIN)
+    if voice_median > 1e-6 and music_median > 1e-6:
+        safe_gain = MUSIC_MAX_VOICE_RATIO * (voice_median / music_median)
+        base_gain = max(0.04, min(base_gain, safe_gain))
+
+    duck_gain = max(0.022, min(base_gain * 0.52, MUSIC_DUCKED_GAIN))
+    spread = max(1e-6, voice_p90 - voice_median)
+
+    def gain_at(t: float) -> float:
+        e = _series_at(voice_s, float(t), MUSIC_ENVELOPE_STEP_SECONDS)
+        speech_presence = max(0.0, min(1.0, (e - voice_median) / spread))
+        return base_gain - (base_gain - duck_gain) * speech_presence
+
+    def gain_array(times: np.ndarray) -> np.ndarray:
+        time_arr = np.asarray(times, dtype=np.float64)
+        if time_arr.size == 0:
+            return np.array([], dtype=np.float32)
+        gains = np.empty(time_arr.shape, dtype=np.float32)
+        flat = gains.reshape(-1)
+        flat_t = time_arr.reshape(-1)
+        for i, ts in enumerate(flat_t):
+            flat[i] = gain_at(float(ts))
+        return gains
+
+    def duck_frame(gf, t: float):
+        frame_arr = np.asarray(gf(t), dtype=np.float32)
+        time_arr = np.asarray(t, dtype=np.float64)
+
+        # Scalar time path (single frame)
+        if time_arr.ndim == 0:
+            return frame_arr * gain_at(float(time_arr))
+
+        gains = gain_array(time_arr).reshape(-1)
+        if gains.size == 0:
+            return frame_arr
+
+        # Typical vectorized audio shape: (num_times, channels)
+        if frame_arr.ndim == 2 and frame_arr.shape[0] == gains.shape[0]:
+            return frame_arr * gains[:, None]
+
+        # Mono vectorized shape: (num_times,)
+        if frame_arr.ndim == 1 and frame_arr.shape[0] == gains.shape[0]:
+            return frame_arr * gains
+
+        # Unknown shape: apply conservative scalar gain using first sample.
+        return frame_arr * float(gains[0])
+
+    mixed = music_clip.fl(duck_frame, keep_duration=True)
+    return mixed, {
+        "base_gain": float(base_gain),
+        "duck_gain": float(duck_gain),
+        "voice_median": float(voice_median),
+        "music_median": float(music_median),
+    }
 
 
 def _wrap_text(
@@ -1320,6 +1497,8 @@ def render_video(
 
     try:
         image_motion_count = 0
+        micro_zoom_count = 0
+        micro_zoom_strength_total = 0.0
         for shot in timeline_clips:
             needed = max(0.2, float(shot.timeline_end - shot.timeline_start))
             if shot.source_path.suffix.lower() in IMAGE_EXTENSIONS:
@@ -1347,6 +1526,16 @@ def render_video(
                 extended = clip.set_duration(needed)
 
             fitted = _fit_clip_to_canvas(extended, width=width, height=height)
+            should_zoom, cycle, pulse_seconds, strength = _micro_zoom_params_for_shot(shot)
+            if should_zoom:
+                fitted = _apply_micro_zooms(
+                    fitted,
+                    pulse_every=cycle,
+                    pulse_seconds=pulse_seconds,
+                    strength=strength,
+                )
+                micro_zoom_count += 1
+                micro_zoom_strength_total += strength
             assembled.append(fitted)
 
         if not assembled:
@@ -1379,11 +1568,14 @@ def render_video(
             detail = ", ".join(f"{name}={count}" for name, count in sorted(transition_counts.items()))
             log(f"Transition mix: {detail}")
 
-        final_video = _apply_micro_zooms(final_video)
-        log(
-            f"Micro-zooms enabled: every {MICRO_ZOOM_EVERY_SECONDS:.2f}s "
-            f"(pulse {MICRO_ZOOM_PULSE_SECONDS:.2f}s, strength {MICRO_ZOOM_STRENGTH:.3f})"
-        )
+        if micro_zoom_count > 0:
+            avg_strength = micro_zoom_strength_total / micro_zoom_count
+            log(
+                f"Micro-zooms enabled on {micro_zoom_count}/{len(timeline_clips)} shots "
+                f"(adaptive cycle around {MICRO_ZOOM_EVERY_SECONDS:.2f}s, avg strength {avg_strength:.3f})"
+            )
+        else:
+            log("Micro-zooms skipped: scene pacing favored stable framing")
 
         voice_duration = float(voiceover_clip.duration)
         if float(final_video.duration) < voice_duration:
@@ -1435,8 +1627,32 @@ def render_video(
         if music_track:
             log(f"Selected music track: {music_track.name}")
             music_clip = AudioFileClip(str(music_track))
-            music_clip = audio_loop(music_clip, duration=final_duration).volumex(0.15)
-            tracks.append(music_clip)
+            music_looped = audio_loop(music_clip, duration=final_duration)
+            try:
+                mixed_music, mix_stats = _adaptive_music_mix(
+                    music_clip=music_looped,
+                    voiceover_clip=voiceover_clip,
+                    final_duration=final_duration,
+                )
+                log(
+                    "Music blend: adaptive ducking "
+                    f"(base={mix_stats['base_gain']:.3f}, ducked={mix_stats['duck_gain']:.3f})"
+                )
+            except Exception as exc:
+                log(f"Music blend fallback: adaptive ducking failed ({exc}); using static background gain")
+                mixed_music = music_looped.volumex(0.10)
+
+            fade_in = min(MUSIC_FADE_IN_SECONDS, max(0.06, final_duration * 0.20))
+            fade_out = min(MUSIC_FADE_OUT_SECONDS, max(0.06, final_duration * 0.24))
+            if (fade_in + fade_out) > (final_duration * 0.90):
+                scale = (final_duration * 0.90) / max(1e-6, (fade_in + fade_out))
+                fade_in *= scale
+                fade_out *= scale
+
+            mixed_music = audio_fadein(mixed_music, fade_in)
+            mixed_music = audio_fadeout(mixed_music, fade_out)
+            log(f"Music fades: in={fade_in:.2f}s, out={fade_out:.2f}s")
+            tracks.append(mixed_music)
 
         if len(tracks) == 1:
             final_audio = tracks[0].set_duration(final_duration)

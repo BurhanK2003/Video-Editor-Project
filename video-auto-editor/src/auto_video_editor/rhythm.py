@@ -11,10 +11,70 @@ BEAT_SNAP_TOLERANCE_SECONDS = 0.15
 MIN_CLIP_DURATION_SECONDS = 0.35
 
 
-def resolve_music_track(music_path: Path | None) -> Path | None:
+def _safe_scalar(value: object, fallback: float = 0.0) -> float:
+    try:
+        import numpy as np
+
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return float(arr)
+        if arr.size == 0:
+            return float(fallback)
+        return float(arr.reshape(-1)[0])
+    except Exception:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except Exception:
+            return float(fallback)
+
+
+def _audio_duration_seconds(path: Path) -> float | None:
+    try:
+        from moviepy.editor import AudioFileClip
+    except Exception:
+        return None
+
+    clip = None
+    try:
+        clip = AudioFileClip(str(path))
+        return float(clip.duration or 0.0)
+    except Exception:
+        return None
+    finally:
+        if clip is not None:
+            clip.close()
+
+
+def _music_keyword_score(path: Path) -> float:
+    name = path.stem.lower()
+    prefer = (
+        "ambient", "cinematic", "instrumental", "background", "underscore",
+        "soft", "calm", "nature", "documentary", "atmos", "drone",
+    )
+    avoid = (
+        "vocal", "vocals", "song", "lyrics", "trap", "metal", "hard", "bassboost",
+        "dubstep", "edm", "phonk", "aggressive", "scream", "shout",
+    )
+    score = 0.0
+    for token in prefer:
+        if token in name:
+            score += 0.14
+    for token in avoid:
+        if token in name:
+            score -= 0.18
+    return score
+
+
+def resolve_music_track(
+    music_path: Path | None,
+    voiceover_path: Path | None = None,
+    log: callable | None = None,
+) -> Path | None:
     if music_path is None or not music_path.exists():
         return None
     if music_path.is_file() and music_path.suffix.lower() in AUDIO_EXTENSIONS:
+        if log:
+            log(f"Music source: using explicit file ({music_path.name})")
         return music_path
     if not music_path.is_dir():
         return None
@@ -26,7 +86,35 @@ def resolve_music_track(music_path: Path | None) -> Path | None:
     ]
     if not tracks:
         return None
-    return random.choice(tracks)
+
+    target_duration = _audio_duration_seconds(voiceover_path) if voiceover_path else None
+    if target_duration is None or target_duration <= 0.0:
+        chosen = random.choice(tracks)
+        if log:
+            log(f"Music source: folder mode fallback (random) -> {chosen.name}")
+        return chosen
+
+    scored: list[tuple[float, Path, float | None]] = []
+    for track in tracks:
+        dur = _audio_duration_seconds(track)
+        duration_score = 0.0
+        if dur is not None and dur > 0.0:
+            distance = abs(dur - target_duration) / max(12.0, target_duration)
+            duration_score = max(-0.7, 0.45 - distance)
+            if dur < max(6.0, 0.45 * target_duration):
+                duration_score -= 0.30
+        score = duration_score + _music_keyword_score(track)
+        scored.append((score, track, dur))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_track, best_dur = scored[0]
+    if log:
+        dur_text = f"{best_dur:.1f}s" if best_dur is not None else "unknown"
+        log(
+            f"Music source: folder mode best-match -> {best_track.name} "
+            f"(score={best_score:.2f}, track={dur_text}, voiceover={target_duration:.1f}s)"
+        )
+    return best_track
 
 
 def detect_music_beats(music_path: Path, log: callable | None = None) -> list[float]:
@@ -48,7 +136,8 @@ def detect_music_beats(music_path: Path, log: callable | None = None) -> list[fl
 
     beats = sorted(float(t) for t in beat_times if float(t) > 0.0)
     if log:
-        log(f"Beat sync source: music ({music_path.name}) | beats={len(beats)} | tempo={float(tempo):.1f} BPM")
+        tempo_value = _safe_scalar(tempo, fallback=0.0)
+        log(f"Beat sync source: music ({music_path.name}) | beats={len(beats)} | tempo={tempo_value:.1f} BPM")
     return beats
 
 

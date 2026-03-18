@@ -170,7 +170,7 @@ def _llm_cinematic_query(text: str, emotion: str) -> str | None:
     Falls back to None if no LLM is reachable (caller uses keyword fallback).
     """
     _load_query_cache()
-    cache_key = f"{text.lower().strip()}|{emotion}"
+    cache_key = f"qv2|{text.lower().strip()}|{emotion}"
     if cache_key in _QUERY_CACHE:
         return _QUERY_CACHE[cache_key]
 
@@ -266,7 +266,7 @@ def _ollama_structured_scene_plan(
     """Return a validated scene profile from Ollama strict JSON mode."""
     _load_scene_plan_cache()
     cache_key = (
-        f"scene:v1|{text.lower().strip()}|{fallback_emotion}|{fallback_transition}|"
+        f"scene:v2|{text.lower().strip()}|{fallback_emotion}|{fallback_transition}|"
         f"{fallback_pacing}|{fallback_clip_length:.2f}"
     )
     cached = _SCENE_PLAN_CACHE.get(cache_key)
@@ -406,6 +406,12 @@ ABSTRACT_VISUAL_STOPWORDS = {
     "believe",
     "watch",
     "hear",
+    "speak",
+    "speaks",
+    "word",
+    "words",
+    "whisper",
+    "whispers",
 }
 VISUAL_HINTS_BY_TOKEN = {
     "forget": ["contemplative", "reflection", "close-up"],
@@ -416,6 +422,12 @@ VISUAL_HINTS_BY_TOKEN = {
     "breathe": ["deep breath", "calm", "nature walk"],
     "calm": ["serene", "gentle motion"],
     "focus": ["close-up", "eyes", "detail"],
+    "whisper": ["leaves rustling", "wind through trees", "macro foliage"],
+    "whispers": ["leaves rustling", "wind through trees", "macro foliage"],
+    "speak": ["close-up leaves", "forest wind", "tree canopy motion"],
+    "speaks": ["close-up leaves", "forest wind", "tree canopy motion"],
+    "change": ["season change", "timelapse trees", "falling leaves"],
+    "shift": ["wind-swept grass", "moving branches", "forest detail"],
 }
 NOISE_KEYWORDS = {
     "the",
@@ -474,6 +486,31 @@ NOISE_KEYWORDS = {
     "im",
     "ive",
     "id",
+    "dont",
+    "doesnt",
+    "didnt",
+    "cant",
+    "couldnt",
+    "wont",
+    "wouldnt",
+    "shouldnt",
+    "youre",
+    "youve",
+    "youll",
+    "theyre",
+    "weve",
+    "thats",
+    "whats",
+    "when",
+    "then",
+    "every",
+    "everything",
+    "something",
+    "anything",
+    "nothing",
+    "certainly",
+    "maybe",
+    "perhaps",
 }
 
 SCENE_INTENTS: list[tuple[re.Pattern[str], dict[str, str | float]]] = [
@@ -636,7 +673,95 @@ def _chunk_words(words: list[WordToken], target_size: int) -> list[list[WordToke
     if len(chunks) >= 2 and len(chunks[-1]) == 1:
         chunks[-2].extend(chunks[-1])
         chunks.pop()
+    return _protect_brand_phrase_chunks(chunks)
+
+
+def _clean_token_for_phrase_match(token: str) -> str:
+    return re.sub(r"[^a-zA-Z']+", "", (token or "").lower()).strip()
+
+
+def _protect_brand_phrase_chunks(chunks: list[list[WordToken]]) -> list[list[WordToken]]:
+    """Ensure the brand phrase is never split across chunk boundaries."""
+    if not chunks:
+        return chunks
+
+    phrase = ["nature", "lives", "in", "you"]
+    changed = True
+    while changed and len(chunks) >= 2:
+        changed = False
+        for i in range(len(chunks) - 1):
+            left = chunks[i]
+            right = chunks[i + 1]
+            if not left or not right:
+                continue
+
+            left_tail = [_clean_token_for_phrase_match(w.text) for w in left[-3:]]
+            right_head = [_clean_token_for_phrase_match(w.text) for w in right[:3]]
+            seam = left_tail + right_head
+            if len(seam) < len(phrase):
+                continue
+
+            if any(seam[j : j + len(phrase)] == phrase for j in range(0, len(seam) - len(phrase) + 1)):
+                merged = left + right
+                chunks[i] = merged
+                del chunks[i + 1]
+                changed = True
+                break
+
     return chunks
+
+
+def _merge_segments_for_brand_phrase(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    """Merge adjacent transcript segments when the brand phrase spans a boundary."""
+    if not segments:
+        return segments
+
+    merged = list(segments)
+    changed = True
+    while changed and len(merged) >= 2:
+        changed = False
+        next_segments: list[TranscriptSegment] = []
+        i = 0
+        while i < len(merged):
+            current = merged[i]
+            if i + 1 >= len(merged):
+                next_segments.append(current)
+                i += 1
+                continue
+
+            nxt = merged[i + 1]
+            current_norm = _normalize_brand_phrase((current.text or "").strip())
+            next_norm = _normalize_brand_phrase((nxt.text or "").strip())
+            combined_norm = _normalize_brand_phrase(f"{current_norm} {next_norm}".strip())
+
+            brand_in_combined = BRAND_PHRASE.lower() in combined_norm.lower()
+            brand_already_whole = (
+                BRAND_PHRASE.lower() in current_norm.lower()
+                or BRAND_PHRASE.lower() in next_norm.lower()
+            )
+
+            if brand_in_combined and not brand_already_whole:
+                current_words = list(current.words or [])
+                next_words = list(nxt.words or [])
+                merged_words = current_words + next_words
+                next_segments.append(
+                    TranscriptSegment(
+                        start=float(min(current.start, nxt.start)),
+                        end=float(max(current.end, nxt.end)),
+                        text=combined_norm,
+                        words=merged_words or None,
+                    )
+                )
+                i += 2
+                changed = True
+                continue
+
+            next_segments.append(current)
+            i += 1
+
+        merged = next_segments
+
+    return merged
 
 
 def _clip_length_seconds(words_per_second: float) -> float:
@@ -706,25 +831,49 @@ def _cinematic_query(text: str, emotion: str) -> str:
     if "forget" in lower_text:
         visual_hints.extend(["contemplative", "portrait", "soft light"])
 
-    # Put content-specific words first; keep nature anchors as fallback context.
+    # Put content-specific words first; only add broad nature anchors when needed.
     deduped: list[str] = []
     seen: set[str] = set()
-    for token in [*visual_hints, *filtered, *NATURE_THEME_TERMS]:
+    for token in [*visual_hints, *filtered]:
         if token in seen:
             continue
         seen.add(token)
         deduped.append(token)
 
-    base = " ".join(deduped[:7]) if deduped else "nature wildlife documentary"
+    if len(deduped) < 3:
+        for token in NATURE_THEME_TERMS:
+            if token in seen:
+                continue
+            seen.add(token)
+            deduped.append(token)
+
+    if deduped:
+        base_terms: list[str] = []
+        used_words = 0
+        for term in deduped:
+            words = [w for w in term.split() if w]
+            if not words:
+                continue
+            if used_words >= 7:
+                break
+            if used_words + len(words) > 7 and base_terms:
+                continue
+            base_terms.append(" ".join(words))
+            used_words += len(words)
+        if not base_terms:
+            base_terms = ["nature", "wildlife"]
+    else:
+        base_terms = ["nature", "wildlife"]
+    base = " ".join(base_terms)
 
     if BRAND_PHRASE.lower() in text.lower():
         return "cinematic forest mist sunlight nature life close-up 4k"
 
     if emotion == "suspense":
-        return f"cinematic dramatic {base} moody lighting 4k"
+        return f"cinematic {base} moody atmosphere natural light 4k"
     if emotion == "excitement":
-        return f"cinematic action {base} dynamic movement 4k"
-    return f"cinematic {base} natural light movement 4k"
+        return f"cinematic {base} dynamic motion handheld 4k"
+    return f"cinematic {base} natural light b-roll 4k"
 
 
 def _scene_intent_profile(text: str) -> dict[str, str | float]:
@@ -754,6 +903,8 @@ def _words_from_segment(seg: TranscriptSegment) -> list[WordToken]:
 
 
 def build_plan(segments: list[TranscriptSegment], log: callable | None = None) -> list[PlannedSegment]:
+    segments = _merge_segments_for_brand_phrase(segments)
+
     plan: list[PlannedSegment] = []
     recent_transitions: list[str] = []
     attention_toggle = False

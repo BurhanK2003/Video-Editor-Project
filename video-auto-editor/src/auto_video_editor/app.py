@@ -27,6 +27,8 @@ CAPTION_STYLE_MAP = {
     "Gradient Fill": "gradient_fill",
 }
 
+AUDIO_FILE_TYPES = "*.wav *.mp3 *.m4a *.aac *.flac *.ogg"
+
 
 class AutoEditorApp:
     def __init__(self, root: tk.Tk):
@@ -169,9 +171,9 @@ class AutoEditorApp:
         )
         self._path_row(
             controls_frame,
-            label="Music Folder",
+            label="Music (File/Folder)",
             text_var=self.music_var,
-            browse_command=self._pick_music_folder,
+            browse_command=self._pick_music_source,
         )
         self._path_row(
             controls_frame,
@@ -447,8 +449,14 @@ class AutoEditorApp:
         if selected:
             self.clips_var.set(selected)
 
-    def _pick_music_folder(self) -> None:
-        selected = filedialog.askdirectory(title="Select Music Folder", initialdir=str(Path.cwd()))
+    def _pick_music_source(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Music File (or Cancel to choose folder)",
+            initialdir=str(Path.cwd()),
+            filetypes=[("Audio Files", AUDIO_FILE_TYPES)],
+        )
+        if not selected:
+            selected = filedialog.askdirectory(title="Select Music Folder", initialdir=str(Path.cwd()))
         if selected:
             self.music_var.set(selected)
 
@@ -524,8 +532,10 @@ class AutoEditorApp:
             raise ValueError("Voiceover file does not exist.")
         if clips_folder and (not clips_folder.exists() or not clips_folder.is_dir()):
             raise ValueError("Clips folder must exist if provided.")
-        if music and (not music.exists() or not music.is_dir()):
-            raise ValueError("Music folder does not exist.")
+        if music and (not music.exists() or not (music.is_dir() or music.is_file())):
+            raise ValueError("Music source must be an existing file or folder.")
+        if music and music.is_file() and music.suffix.lower() not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
+            raise ValueError("Music file must be a supported audio type.")
         if logo and (not logo.exists() or not logo.is_file()):
             raise ValueError("Logo file does not exist.")
         if logo and logo.suffix.lower() != ".png":
@@ -602,8 +612,10 @@ class AutoEditorApp:
 
         if clips_folder and (not clips_folder.exists() or not clips_folder.is_dir()):
             raise ValueError("Clips folder must exist if provided.")
-        if music and (not music.exists() or not music.is_dir()):
-            raise ValueError("Music folder does not exist.")
+        if music and (not music.exists() or not (music.is_dir() or music.is_file())):
+            raise ValueError("Music source must be an existing file or folder.")
+        if music and music.is_file() and music.suffix.lower() not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
+            raise ValueError("Music file must be a supported audio type.")
         if logo and (not logo.exists() or not logo.is_file()):
             raise ValueError("Logo file does not exist.")
         if logo and logo.suffix.lower() != ".png":
