@@ -16,6 +16,13 @@ from .models import PlannedSegment, TranscriptSegment, WordToken
 _QUERY_CACHE: dict[str, str] = {}
 _QUERY_CACHE_FILE = Path(".llm_query_cache.json")
 _CACHE_LOADED = False
+_SCENE_PLAN_CACHE: dict[str, dict] = {}
+_SCENE_PLAN_CACHE_FILE = Path(".llm_scene_plan_cache.json")
+_SCENE_PLAN_CACHE_LOADED = False
+
+VALID_EMOTIONS = {"curiosity", "suspense", "excitement"}
+VALID_PACING = {"slow", "medium", "fast"}
+VALID_TRANSITIONS = {"jump_cut", "zoom_in", "whip", "fade"}
 
 
 def _load_query_cache() -> None:
@@ -39,6 +46,29 @@ def _save_query_cache() -> None:
         pass
 
 
+def _load_scene_plan_cache() -> None:
+    global _SCENE_PLAN_CACHE_LOADED
+    if _SCENE_PLAN_CACHE_LOADED:
+        return
+    _SCENE_PLAN_CACHE_LOADED = True
+    try:
+        if _SCENE_PLAN_CACHE_FILE.exists():
+            payload = json.loads(_SCENE_PLAN_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                _SCENE_PLAN_CACHE.update(payload)
+    except Exception:
+        pass
+
+
+def _save_scene_plan_cache() -> None:
+    try:
+        _SCENE_PLAN_CACHE_FILE.write_text(
+            json.dumps(_SCENE_PLAN_CACHE, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def _call_ollama(prompt: str) -> str | None:
     """Call local Ollama (http://localhost:11434). Free, no API key, runs offline."""
     payload = json.dumps({
@@ -57,6 +87,50 @@ def _call_ollama(prompt: str) -> str | None:
         with urlopen(req, timeout=8) as resp:
             result = json.loads(resp.read().decode())
             return (result.get("response") or "").strip()
+    except Exception:
+        return None
+
+
+def _call_ollama_json(prompt: str, *, timeout: int = 12, num_predict: int = 320) -> dict | None:
+    """Call Ollama in strict JSON mode and parse a JSON object response."""
+    payload = json.dumps(
+        {
+            "model": "llama3.2",
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.25, "num_predict": int(max(64, num_predict))},
+        }
+    ).encode()
+    try:
+        req = Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=max(4, int(timeout))) as resp:
+            result = json.loads(resp.read().decode())
+            response_text = str(result.get("response") or "").strip()
+    except Exception:
+        return None
+
+    if not response_text:
+        return None
+
+    try:
+        parsed = json.loads(response_text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    # Defensive extraction if model leaks wrapper text around JSON.
+    match = re.search(r"\{[\s\S]*\}", response_text)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None
 
@@ -96,7 +170,7 @@ def _llm_cinematic_query(text: str, emotion: str) -> str | None:
     Falls back to None if no LLM is reachable (caller uses keyword fallback).
     """
     _load_query_cache()
-    cache_key = f"{text.lower().strip()}|{emotion}"
+    cache_key = f"qv2|{text.lower().strip()}|{emotion}"
     if cache_key in _QUERY_CACHE:
         return _QUERY_CACHE[cache_key]
 
@@ -119,6 +193,184 @@ def _llm_cinematic_query(text: str, emotion: str) -> str | None:
             _save_query_cache()
             return cleaned
     return None
+
+
+def _normalized_emotion(value: str | None, fallback: str) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in VALID_EMOTIONS else fallback
+
+
+def _normalized_pacing(value: str | None, fallback: str = "fast") -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in VALID_PACING else fallback
+
+
+def _normalized_transition(value: str | None, fallback: str) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in VALID_TRANSITIONS else fallback
+
+
+def _normalized_clip_length(value: object, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return fallback
+    return max(1.0, min(3.5, parsed))
+
+
+def _normalized_emphasis_words(raw: object, fallback_text: str) -> list[str]:
+    words: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            token = re.sub(r"[^A-Za-z']+", "", str(item or "")).lower().strip()
+            if token:
+                words.append(token)
+    if not words:
+        words = _important_words(fallback_text)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        if word in seen:
+            continue
+        seen.add(word)
+        deduped.append(word)
+    return deduped[:4]
+
+
+def _normalized_highlight_phrase(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return " ".join(text.split()[:6])
+
+
+def _normalized_visual_query(raw: object, fallback: str) -> str:
+    query = re.sub(r"[\r\n\t]+", " ", str(raw or "")).strip()
+    if not query:
+        return fallback
+    query = re.sub(r"[\"']", "", query)
+    query = " ".join(query.split()[:12]).strip()
+    return query if len(query) >= 5 else fallback
+
+
+def _ollama_structured_scene_plan(
+    text: str,
+    *,
+    fallback_query: str,
+    fallback_emotion: str,
+    fallback_transition: str,
+    fallback_clip_length: float,
+    fallback_pacing: str = "fast",
+) -> dict | None:
+    """Return a validated scene profile from Ollama strict JSON mode."""
+    _load_scene_plan_cache()
+    cache_key = (
+        f"scene:v2|{text.lower().strip()}|{fallback_emotion}|{fallback_transition}|"
+        f"{fallback_pacing}|{fallback_clip_length:.2f}"
+    )
+    cached = _SCENE_PLAN_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    prompt = (
+        "You are a short-form video scene planner. Return JSON only.\n"
+        "Given one narration chunk, produce a concrete stock-footage scene profile.\n"
+        "Allowed values:\n"
+        "- emotion: curiosity | suspense | excitement\n"
+        "- pacing: slow | medium | fast\n"
+        "- transition_type: jump_cut | zoom_in | whip | fade\n"
+        "- clip_length_seconds: number between 1.0 and 3.5\n"
+        "JSON schema:\n"
+        '{"visual_query":"string max 12 words",'
+        '"emotion":"string",'
+        '"pacing":"string",'
+        '"transition_type":"string",'
+        '"clip_length_seconds":1.6,'
+        '"emphasis_words":["word1","word2"],'
+        '"highlight_phrase":"short optional phrase"}\n'
+        f"Narration chunk: {text}\n"
+        f"Current best visual query: {fallback_query}\n"
+        f"Current emotion: {fallback_emotion}\n"
+        "Output only one JSON object."
+    )
+    raw = _call_ollama_json(prompt, timeout=12, num_predict=300)
+    if not isinstance(raw, dict):
+        return None
+
+    profile = {
+        "visual_query": _normalized_visual_query(raw.get("visual_query"), fallback_query),
+        "emotion": _normalized_emotion(raw.get("emotion"), fallback_emotion),
+        "pacing": _normalized_pacing(raw.get("pacing"), fallback_pacing),
+        "transition_type": _normalized_transition(raw.get("transition_type"), fallback_transition),
+        "clip_length_seconds": _normalized_clip_length(raw.get("clip_length_seconds"), fallback_clip_length),
+        "emphasis_words": _normalized_emphasis_words(raw.get("emphasis_words"), text),
+        "highlight_phrase": _normalized_highlight_phrase(raw.get("highlight_phrase")),
+    }
+    _SCENE_PLAN_CACHE[cache_key] = profile
+    _save_scene_plan_cache()
+    return profile
+
+
+def _ollama_critic_pass(plan_payload: list[dict]) -> dict[int, dict]:
+    """Critic pass that revises repetitive/weak scene specs via strict JSON edits."""
+    if not plan_payload:
+        return {}
+
+    compact = []
+    for idx, seg in enumerate(plan_payload[:40]):
+        compact.append(
+            {
+                "index": idx,
+                "text": str(seg.get("text") or "")[:120],
+                "visual_query": str(seg.get("visual_query") or ""),
+                "emotion": str(seg.get("emotion") or "curiosity"),
+                "transition_type": str(seg.get("transition_type") or "jump_cut"),
+                "clip_length_seconds": float(seg.get("clip_length_seconds") or 1.6),
+            }
+        )
+
+    prompt = (
+        "You are a scene-plan critic for short-form videos. Return JSON only.\n"
+        "Task: find repetitive, vague, or low-energy visual plans and propose minimal edits.\n"
+        "Rules:\n"
+        "- Keep the original meaning of narration.\n"
+        "- Edit only scenes that need improvement.\n"
+        "- Use allowed values: emotion {curiosity,suspense,excitement}, transition_type {jump_cut,zoom_in,whip,fade}.\n"
+        "- clip_length_seconds must be between 1.0 and 3.5.\n"
+        "Output schema:\n"
+        '{"edits":[{"index":3,"visual_query":"...","emotion":"curiosity",'
+        '"transition_type":"whip","clip_length_seconds":1.4,"reason":"..."}]}\n'
+        f"Current scene plan JSON:\n{json.dumps(compact, ensure_ascii=True)}"
+    )
+    raw = _call_ollama_json(prompt, timeout=14, num_predict=420)
+    if not isinstance(raw, dict):
+        return {}
+
+    edits: dict[int, dict] = {}
+    raw_edits = raw.get("edits")
+    if not isinstance(raw_edits, list):
+        return edits
+
+    for item in raw_edits:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index"))
+        except Exception:
+            continue
+        if idx < 0 or idx >= len(plan_payload):
+            continue
+
+        original = plan_payload[idx]
+        edits[idx] = {
+            "visual_query": _normalized_visual_query(item.get("visual_query"), str(original.get("visual_query") or "")),
+            "emotion": _normalized_emotion(item.get("emotion"), str(original.get("emotion") or "curiosity")),
+            "transition_type": _normalized_transition(item.get("transition_type"), str(original.get("transition_type") or "jump_cut")),
+            "clip_length_seconds": _normalized_clip_length(item.get("clip_length_seconds"), float(original.get("clip_length_seconds") or 1.6)),
+            "reason": str(item.get("reason") or "").strip(),
+        }
+    return edits
 
 
 BRAND_PHRASE = "Nature Lives In You"
@@ -154,6 +406,12 @@ ABSTRACT_VISUAL_STOPWORDS = {
     "believe",
     "watch",
     "hear",
+    "speak",
+    "speaks",
+    "word",
+    "words",
+    "whisper",
+    "whispers",
 }
 VISUAL_HINTS_BY_TOKEN = {
     "forget": ["contemplative", "reflection", "close-up"],
@@ -164,6 +422,12 @@ VISUAL_HINTS_BY_TOKEN = {
     "breathe": ["deep breath", "calm", "nature walk"],
     "calm": ["serene", "gentle motion"],
     "focus": ["close-up", "eyes", "detail"],
+    "whisper": ["leaves rustling", "wind through trees", "macro foliage"],
+    "whispers": ["leaves rustling", "wind through trees", "macro foliage"],
+    "speak": ["close-up leaves", "forest wind", "tree canopy motion"],
+    "speaks": ["close-up leaves", "forest wind", "tree canopy motion"],
+    "change": ["season change", "timelapse trees", "falling leaves"],
+    "shift": ["wind-swept grass", "moving branches", "forest detail"],
 }
 NOISE_KEYWORDS = {
     "the",
@@ -222,6 +486,31 @@ NOISE_KEYWORDS = {
     "im",
     "ive",
     "id",
+    "dont",
+    "doesnt",
+    "didnt",
+    "cant",
+    "couldnt",
+    "wont",
+    "wouldnt",
+    "shouldnt",
+    "youre",
+    "youve",
+    "youll",
+    "theyre",
+    "weve",
+    "thats",
+    "whats",
+    "when",
+    "then",
+    "every",
+    "everything",
+    "something",
+    "anything",
+    "nothing",
+    "certainly",
+    "maybe",
+    "perhaps",
 }
 
 SCENE_INTENTS: list[tuple[re.Pattern[str], dict[str, str | float]]] = [
@@ -384,7 +673,95 @@ def _chunk_words(words: list[WordToken], target_size: int) -> list[list[WordToke
     if len(chunks) >= 2 and len(chunks[-1]) == 1:
         chunks[-2].extend(chunks[-1])
         chunks.pop()
+    return _protect_brand_phrase_chunks(chunks)
+
+
+def _clean_token_for_phrase_match(token: str) -> str:
+    return re.sub(r"[^a-zA-Z']+", "", (token or "").lower()).strip()
+
+
+def _protect_brand_phrase_chunks(chunks: list[list[WordToken]]) -> list[list[WordToken]]:
+    """Ensure the brand phrase is never split across chunk boundaries."""
+    if not chunks:
+        return chunks
+
+    phrase = ["nature", "lives", "in", "you"]
+    changed = True
+    while changed and len(chunks) >= 2:
+        changed = False
+        for i in range(len(chunks) - 1):
+            left = chunks[i]
+            right = chunks[i + 1]
+            if not left or not right:
+                continue
+
+            left_tail = [_clean_token_for_phrase_match(w.text) for w in left[-3:]]
+            right_head = [_clean_token_for_phrase_match(w.text) for w in right[:3]]
+            seam = left_tail + right_head
+            if len(seam) < len(phrase):
+                continue
+
+            if any(seam[j : j + len(phrase)] == phrase for j in range(0, len(seam) - len(phrase) + 1)):
+                merged = left + right
+                chunks[i] = merged
+                del chunks[i + 1]
+                changed = True
+                break
+
     return chunks
+
+
+def _merge_segments_for_brand_phrase(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    """Merge adjacent transcript segments when the brand phrase spans a boundary."""
+    if not segments:
+        return segments
+
+    merged = list(segments)
+    changed = True
+    while changed and len(merged) >= 2:
+        changed = False
+        next_segments: list[TranscriptSegment] = []
+        i = 0
+        while i < len(merged):
+            current = merged[i]
+            if i + 1 >= len(merged):
+                next_segments.append(current)
+                i += 1
+                continue
+
+            nxt = merged[i + 1]
+            current_norm = _normalize_brand_phrase((current.text or "").strip())
+            next_norm = _normalize_brand_phrase((nxt.text or "").strip())
+            combined_norm = _normalize_brand_phrase(f"{current_norm} {next_norm}".strip())
+
+            brand_in_combined = BRAND_PHRASE.lower() in combined_norm.lower()
+            brand_already_whole = (
+                BRAND_PHRASE.lower() in current_norm.lower()
+                or BRAND_PHRASE.lower() in next_norm.lower()
+            )
+
+            if brand_in_combined and not brand_already_whole:
+                current_words = list(current.words or [])
+                next_words = list(nxt.words or [])
+                merged_words = current_words + next_words
+                next_segments.append(
+                    TranscriptSegment(
+                        start=float(min(current.start, nxt.start)),
+                        end=float(max(current.end, nxt.end)),
+                        text=combined_norm,
+                        words=merged_words or None,
+                    )
+                )
+                i += 2
+                changed = True
+                continue
+
+            next_segments.append(current)
+            i += 1
+
+        merged = next_segments
+
+    return merged
 
 
 def _clip_length_seconds(words_per_second: float) -> float:
@@ -454,25 +831,49 @@ def _cinematic_query(text: str, emotion: str) -> str:
     if "forget" in lower_text:
         visual_hints.extend(["contemplative", "portrait", "soft light"])
 
-    # Put content-specific words first; keep nature anchors as fallback context.
+    # Put content-specific words first; only add broad nature anchors when needed.
     deduped: list[str] = []
     seen: set[str] = set()
-    for token in [*visual_hints, *filtered, *NATURE_THEME_TERMS]:
+    for token in [*visual_hints, *filtered]:
         if token in seen:
             continue
         seen.add(token)
         deduped.append(token)
 
-    base = " ".join(deduped[:7]) if deduped else "nature wildlife documentary"
+    if len(deduped) < 3:
+        for token in NATURE_THEME_TERMS:
+            if token in seen:
+                continue
+            seen.add(token)
+            deduped.append(token)
+
+    if deduped:
+        base_terms: list[str] = []
+        used_words = 0
+        for term in deduped:
+            words = [w for w in term.split() if w]
+            if not words:
+                continue
+            if used_words >= 7:
+                break
+            if used_words + len(words) > 7 and base_terms:
+                continue
+            base_terms.append(" ".join(words))
+            used_words += len(words)
+        if not base_terms:
+            base_terms = ["nature", "wildlife"]
+    else:
+        base_terms = ["nature", "wildlife"]
+    base = " ".join(base_terms)
 
     if BRAND_PHRASE.lower() in text.lower():
         return "cinematic forest mist sunlight nature life close-up 4k"
 
     if emotion == "suspense":
-        return f"cinematic dramatic {base} moody lighting 4k"
+        return f"cinematic {base} moody atmosphere natural light 4k"
     if emotion == "excitement":
-        return f"cinematic action {base} dynamic movement 4k"
-    return f"cinematic {base} natural light movement 4k"
+        return f"cinematic {base} dynamic motion handheld 4k"
+    return f"cinematic {base} natural light b-roll 4k"
 
 
 def _scene_intent_profile(text: str) -> dict[str, str | float]:
@@ -501,10 +902,14 @@ def _words_from_segment(seg: TranscriptSegment) -> list[WordToken]:
     return tokens
 
 
-def build_plan(segments: list[TranscriptSegment]) -> list[PlannedSegment]:
+def build_plan(segments: list[TranscriptSegment], log: callable | None = None) -> list[PlannedSegment]:
+    segments = _merge_segments_for_brand_phrase(segments)
+
     plan: list[PlannedSegment] = []
     recent_transitions: list[str] = []
     attention_toggle = False
+
+    scene_payload: list[dict] = []
 
     for seg in segments:
         seg_text = _normalize_brand_phrase((seg.text or "").strip())
@@ -536,9 +941,33 @@ def build_plan(segments: list[TranscriptSegment]) -> list[PlannedSegment]:
             )
             if intent.get("transition_type"):
                 transition_type = str(intent["transition_type"])
-            recent_transitions.append(transition_type)
 
             segment_clip_len = float(intent.get("clip_length_seconds") or clip_len)
+            base_query = str(intent.get("query") or _cinematic_query(chunk_text, emotion))
+
+            structured = _ollama_structured_scene_plan(
+                chunk_text,
+                fallback_query=base_query,
+                fallback_emotion=emotion,
+                fallback_transition=transition_type,
+                fallback_clip_length=segment_clip_len,
+                fallback_pacing="fast",
+            )
+            if structured:
+                emotion = str(structured.get("emotion") or emotion)
+                transition_type = str(structured.get("transition_type") or transition_type)
+                segment_clip_len = float(structured.get("clip_length_seconds") or segment_clip_len)
+                emphasis_words = _normalized_emphasis_words(structured.get("emphasis_words"), chunk_text)
+                highlight_phrase = _normalized_highlight_phrase(structured.get("highlight_phrase"))
+                visual_query = _normalized_visual_query(structured.get("visual_query"), base_query)
+                pacing = _normalized_pacing(str(structured.get("pacing") or ""), "fast")
+            else:
+                visual_query = base_query
+                highlight_phrase = BRAND_PHRASE if BRAND_PHRASE.lower() in chunk_text.lower() else ""
+                pacing = "fast"
+
+            recent_transitions.append(transition_type)
+
             transition_after = segment_clip_len >= 1.1 and consumed_words < len(words)
             if transition_type == "fade":
                 transition_seconds = 0.22
@@ -568,18 +997,57 @@ def build_plan(segments: list[TranscriptSegment]) -> list[PlannedSegment]:
                     emphasis=bool(emphasis_words)
                     or BRAND_PHRASE.lower() in styled_text.lower()
                     or alternating_emphasis,
-                    highlight_phrase=BRAND_PHRASE if BRAND_PHRASE.lower() in styled_text.lower() else "",
+                    highlight_phrase=highlight_phrase,
                     emphasis_words=emphasis_words,
                     word_tokens=[
                         WordToken(start=float(w.start), end=float(w.end), text=w.text)
                         for w in chunk
                     ],
-                    visual_query=str(intent.get("query") or _cinematic_query(styled_text, emotion)),
+                    visual_query=visual_query,
                     emotion=emotion,
-                    pacing="fast",
+                    pacing=pacing,
                     transition_type=transition_type,
                     clip_length_seconds=segment_clip_len,
                 )
             )
+
+            scene_payload.append(
+                {
+                    "text": styled_text,
+                    "visual_query": visual_query,
+                    "emotion": emotion,
+                    "transition_type": transition_type,
+                    "clip_length_seconds": segment_clip_len,
+                }
+            )
+
+    critic_edits = _ollama_critic_pass(scene_payload)
+    if critic_edits:
+        for idx, edit in critic_edits.items():
+            if idx < 0 or idx >= len(plan):
+                continue
+            original = plan[idx]
+            plan[idx] = PlannedSegment(
+                start=original.start,
+                end=original.end,
+                text=original.text,
+                duration=original.duration,
+                transition_after=original.transition_after,
+                transition_seconds=original.transition_seconds,
+                emphasis=original.emphasis,
+                highlight_phrase=original.highlight_phrase,
+                emphasis_words=original.emphasis_words,
+                word_tokens=original.word_tokens,
+                visual_query=_normalized_visual_query(edit.get("visual_query"), original.visual_query),
+                emotion=_normalized_emotion(str(edit.get("emotion") or ""), original.emotion),
+                pacing=original.pacing,
+                transition_type=_normalized_transition(str(edit.get("transition_type") or ""), original.transition_type),
+                clip_length_seconds=_normalized_clip_length(edit.get("clip_length_seconds"), original.clip_length_seconds),
+            )
+            if log and str(edit.get("reason") or "").strip():
+                log(f"Scene critic adjusted segment {idx + 1}: {str(edit.get('reason')).strip()}")
+
+        if log:
+            log(f"Scene critic pass applied: {len(critic_edits)} segment edits")
 
     return plan

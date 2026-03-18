@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -45,6 +47,51 @@ USER_AGENT = "local-auto-video-editor/1.0"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
+@dataclass(frozen=True)
+class StockProviderAdapter:
+    name: str
+    cache_subdir: str
+    api_key_env: str | None
+    fetch_fn: Callable[..., list[Path]]
+
+
+def _build_provider_adapters() -> list[StockProviderAdapter]:
+    """Provider adapter scaffold: register providers in one place."""
+    return [
+        StockProviderAdapter(
+            name="Pexels Video",
+            cache_subdir="pexels",
+            api_key_env="PEXELS_API_KEY",
+            fetch_fn=_download_from_pexels,
+        ),
+        StockProviderAdapter(
+            name="Pixabay Video",
+            cache_subdir="pixabay",
+            api_key_env="PIXABAY_API_KEY",
+            fetch_fn=_download_from_pixabay,
+        ),
+        # New provider: keyless Openverse images for source diversity.
+        StockProviderAdapter(
+            name="Openverse Images",
+            cache_subdir="openverse_images",
+            api_key_env=None,
+            fetch_fn=_download_images_from_openverse,
+        ),
+        StockProviderAdapter(
+            name="Pexels Images",
+            cache_subdir="pexels_images",
+            api_key_env="PEXELS_API_KEY",
+            fetch_fn=_download_images_from_pexels,
+        ),
+        StockProviderAdapter(
+            name="Pixabay Images",
+            cache_subdir="pixabay_images",
+            api_key_env="PIXABAY_API_KEY",
+            fetch_fn=_download_images_from_pixabay,
+        ),
+    ]
+
+
 def fetch_stock_clips(
     plan: list[PlannedSegment],
     output_path: Path,
@@ -53,10 +100,20 @@ def fetch_stock_clips(
     keywords_override: str,
     log: callable,
 ) -> list[Path]:
-    pexels_key = _validated_api_key("PEXELS_API_KEY", log)
-    pixabay_key = _validated_api_key("PIXABAY_API_KEY", log)
-    if not pexels_key and not pixabay_key:
-        log("Stock fetch skipped: no provider API keys configured.")
+    provider_adapters = _build_provider_adapters()
+    provider_keys: dict[str, str] = {}
+    enabled_adapters: list[StockProviderAdapter] = []
+    for adapter in provider_adapters:
+        if not adapter.api_key_env:
+            enabled_adapters.append(adapter)
+            continue
+        key = _validated_api_key(adapter.api_key_env, log)
+        provider_keys[adapter.api_key_env] = key
+        if key:
+            enabled_adapters.append(adapter)
+
+    if not enabled_adapters:
+        log("Stock fetch skipped: no provider API keys configured and no keyless providers enabled.")
         return []
 
     queries = _build_queries(plan, keywords_override)
@@ -72,57 +129,40 @@ def fetch_stock_clips(
         preview = "; ".join(queries[:4])
         log(f"Stock query preview: {preview}")
 
-    if pexels_key and len(downloaded) < target_count:
-        downloaded.extend(
-            _download_from_pexels(
-                api_key=pexels_key,
-                queries=queries,
-                cache_dir=cache_dir / "pexels",
-                width=width,
-                height=height,
-                target_count=target_count - len(downloaded),
-                seen_paths=seen_paths,
-                log=log,
-            )
-        )
+    for adapter in enabled_adapters:
+        if len(downloaded) >= target_count:
+            break
 
-    if pixabay_key and len(downloaded) < target_count:
-        downloaded.extend(
-            _download_from_pixabay(
-                api_key=pixabay_key,
-                queries=queries,
-                cache_dir=cache_dir / "pixabay",
-                width=width,
-                height=height,
-                target_count=target_count - len(downloaded),
-                seen_paths=seen_paths,
-                log=log,
-            )
-        )
-
-    if pexels_key and len(downloaded) < target_count:
-        downloaded.extend(
-            _download_images_from_pexels(
-                api_key=pexels_key,
-                queries=queries,
-                cache_dir=cache_dir / "pexels_images",
-                target_count=target_count - len(downloaded),
-                seen_paths=seen_paths,
-                log=log,
-            )
-        )
-
-    if pixabay_key and len(downloaded) < target_count:
-        downloaded.extend(
-            _download_images_from_pixabay(
-                api_key=pixabay_key,
-                queries=queries,
-                cache_dir=cache_dir / "pixabay_images",
-                target_count=target_count - len(downloaded),
-                seen_paths=seen_paths,
-                log=log,
-            )
-        )
+        key = provider_keys.get(adapter.api_key_env or "", "") if adapter.api_key_env else ""
+        remaining = target_count - len(downloaded)
+        try:
+            if adapter.api_key_env:
+                downloaded.extend(
+                    adapter.fetch_fn(
+                        api_key=key,
+                        queries=queries,
+                        cache_dir=cache_dir / adapter.cache_subdir,
+                        width=width,
+                        height=height,
+                        target_count=remaining,
+                        seen_paths=seen_paths,
+                        log=log,
+                    )
+                )
+            else:
+                downloaded.extend(
+                    adapter.fetch_fn(
+                        queries=queries,
+                        cache_dir=cache_dir / adapter.cache_subdir,
+                        width=width,
+                        height=height,
+                        target_count=remaining,
+                        seen_paths=seen_paths,
+                        log=log,
+                    )
+                )
+        except Exception as exc:
+            log(f"Provider '{adapter.name}' failed: {exc}")
 
     return downloaded
 
@@ -269,10 +309,13 @@ def _download_images_from_pexels(
     api_key: str,
     queries: list[str],
     cache_dir: Path,
+    width: int,
+    height: int,
     target_count: int,
     seen_paths: set[Path],
     log: callable,
 ) -> list[Path]:
+    del width, height
     results: list[Path] = []
     for query in queries:
         if len(results) >= target_count:
@@ -312,10 +355,13 @@ def _download_images_from_pixabay(
     api_key: str,
     queries: list[str],
     cache_dir: Path,
+    width: int,
+    height: int,
     target_count: int,
     seen_paths: set[Path],
     log: callable,
 ) -> list[Path]:
+    del width, height
     results: list[Path] = []
     for query in queries:
         if len(results) >= target_count:
@@ -348,6 +394,77 @@ def _download_images_from_pixabay(
             if clip_path is not None:
                 results.append(clip_path)
                 break
+    return results
+
+
+def _download_images_from_openverse(
+    queries: list[str],
+    cache_dir: Path,
+    width: int,
+    height: int,
+    target_count: int,
+    seen_paths: set[Path],
+    log: callable,
+) -> list[Path]:
+    del width, height
+    results: list[Path] = []
+    for query in queries:
+        if len(results) >= target_count:
+            break
+
+        params = urlencode(
+            {
+                "q": query,
+                "page_size": 4,
+                "license_type": "commercial",
+                "extension": "jpg,png,webp",
+            }
+        )
+        request = Request(
+            f"https://api.openverse.org/v1/images/?{params}",
+            headers={"User-Agent": USER_AGENT},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            log(f"Openverse request failed for '{query}': {exc}")
+            continue
+
+        found = payload.get("results", [])
+        if isinstance(found, list):
+            log(f"Openverse image results for '{query}': {len(found)}")
+        else:
+            continue
+
+        for photo in found:
+            if len(results) >= target_count:
+                break
+            if not isinstance(photo, dict):
+                continue
+
+            image_url = str(
+                photo.get("url")
+                or photo.get("thumbnail")
+                or photo.get("source")
+                or ""
+            ).strip()
+            if not image_url:
+                continue
+
+            photo_id = str(photo.get("id") or "").strip() or hashlib.md5(image_url.encode("utf-8")).hexdigest()[:12]
+            destination = cache_dir / f"openverse_{photo_id}.jpg"
+            metadata = {
+                "provider": "openverse-image",
+                "query": query,
+                "title": str(photo.get("title") or photo.get("source") or ""),
+                "tags": ",".join(str(t) for t in (photo.get("tags") or [])[:8]),
+            }
+            clip_path = _download_binary(image_url, destination, seen_paths, log, metadata, asset_label="stock image")
+            if clip_path is not None:
+                results.append(clip_path)
+                break
+
     return results
 
 

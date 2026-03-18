@@ -39,7 +39,6 @@ STOP_WORDS = {
     "than",
     "the",
     "them",
-    "than",
     "that",
     "their",
     "there",
@@ -71,14 +70,53 @@ STOP_WORDS = {
     "hit",
     "dropped",
     "drop",
-    "like",
     "subscribe",
     "watch",
     "really",
-    "just",
     "im",
     "ive",
     "id",
+    "is",
+    "am",
+    "was",
+    "up",
+    "on",
+    "at",
+    "be",
+    "get",
+    "got",
+    "as",
+    "to",
+    "by",
+    "it",
+    "do",
+    "go",
+    "or",
+    "if",
+    "when",
+    "then",
+    "every",
+    "everything",
+    "something",
+    "anything",
+    "nothing",
+    "fact",
+    "facts",
+    "certainly",
+    "maybe",
+    "perhaps",
+    "word",
+    "words",
+    "speak",
+    "speaks",
+    "doesnt",
+    "dont",
+    "didnt",
+    "cant",
+    "couldnt",
+    "wont",
+    "wouldnt",
+    "shouldnt",
 }
 NATURE_TERMS = {
     "nature",
@@ -115,21 +153,29 @@ OFF_THEME_TERMS = {
 
 
 def suggest_scene_keywords(text: str, max_keywords: int = 4) -> list[str]:
+    """Extract keywords from text, prioritizing noun-like words and word frequency.
+    
+    Higher-weight keywords (e.g., nouns, verbs) appear earlier in the list.
+    """
     words = re.findall(r"[a-zA-Z']+", text.lower())
     filtered = [w for w in words if len(w) > 2 and w not in STOP_WORDS]
     if not filtered:
-        return ["storytelling"]
+        return []
 
     frequency: dict[str, int] = {}
     for word in filtered:
         frequency[word] = frequency.get(word, 0) + 1
 
-    ordered = sorted(frequency.items(), key=lambda item: (-item[1], item[0]))
+    # Prioritize longer words (likely more specific/meaningful) and higher frequency
+    ordered = sorted(
+        frequency.items(),
+        key=lambda item: (-item[1], -len(item[0]), item[0])
+    )
     return [word for word, _ in ordered[:max_keywords]]
 
 
 def _scene_query(text: str) -> str:
-    keywords = suggest_scene_keywords(text, max_keywords=3)
+    keywords = suggest_scene_keywords(text, max_keywords=4)
     query = " ".join(keywords)
     if "nature lives in you" in text.lower():
         # Reinforce stock search / matching toward nature-first visuals.
@@ -157,17 +203,71 @@ def _movement_score(clip_text: str) -> float:
 
 
 def _keyword_relevance_score(scene_query: str, clip_text: str) -> float:
+    """Score how well a clip matches the scene's keywords.
+    
+    Weights earlier/more-important keywords more heavily.
+    Penalizes clips that have no keyword matches.
+    """
     query_keywords = suggest_scene_keywords(scene_query, max_keywords=6)
     clip_tokens = _tokenize(clip_text)
+    
     if not query_keywords or not clip_tokens:
         return 0.0
-    hits = sum(1 for kw in query_keywords if kw in clip_tokens)
-    return min(0.32, hits * 0.07)
+    
+    total_score = 0.0
+    # Weight earlier keywords more heavily (they're more important)
+    for position, kw in enumerate(query_keywords):
+        if kw in clip_tokens:
+            # Position weight: first keyword worth 0.5, others decay
+            position_weight = 1.0 / (1 + position * 0.4)
+            total_score += 0.15 * position_weight
+    
+    # Strong boost if multiple keywords match
+    hit_count = sum(1 for kw in query_keywords if kw in clip_tokens)
+    if hit_count >= 2:
+        total_score += 0.15  # Bonus for diverse keyword coverage
+    
+    return min(0.75, total_score)
+
+
+def _keyword_relevance_score_fast(keywords: list[str], clip_tokens: set[str]) -> float:
+    """Fast version using pre-computed keywords and tokens. Avoids redundant tokenization."""
+    if not keywords or not clip_tokens:
+        return 0.0
+    
+    total_score = 0.0
+    # Weight earlier keywords more heavily (they're more important)
+    for position, kw in enumerate(keywords):
+        if kw in clip_tokens:
+            # Position weight: first keyword worth 0.5, others decay
+            position_weight = 1.0 / (1 + position * 0.4)
+            total_score += 0.15 * position_weight
+    
+    # Strong boost if multiple keywords match
+    hit_count = sum(1 for kw in keywords if kw in clip_tokens)
+    if hit_count >= 2:
+        total_score += 0.15  # Bonus for diverse keyword coverage
+    
+    return min(0.75, total_score)
 
 
 def _theme_alignment_score(scene_query: str, clip_text: str) -> float:
     scene_tokens = _tokenize(scene_query)
     clip_tokens = _tokenize(clip_text)
+    if not scene_tokens or not clip_tokens:
+        return 0.0
+
+    nature_intent = bool(scene_tokens.intersection(NATURE_TERMS))
+    if not nature_intent:
+        return 0.0
+
+    nature_hits = len(clip_tokens.intersection(NATURE_TERMS))
+    off_theme_hits = len(clip_tokens.intersection(OFF_THEME_TERMS))
+    return min(0.36, nature_hits * 0.09) - min(0.24, off_theme_hits * 0.06)
+
+
+def _theme_alignment_score_fast(scene_tokens: set[str], clip_tokens: set[str]) -> float:
+    """Fast version using pre-computed tokens. Avoids redundant tokenization."""
     if not scene_tokens or not clip_tokens:
         return 0.0
 
@@ -422,23 +522,95 @@ def _select_best_index(
     base_scores: list[float],
     usage_count: list[int],
     recent_indices: list[int],
+    clip_sources: list[str] | None = None,
 ) -> int:
+    """Select the best clip, heavily favoring variety and balancing local vs. stock footage.
+    
+    Uses pre-computed sets for O(1) membership tests instead of O(n) list lookups.
+    
+    Args:
+        base_scores: Visual matching scores per clip
+        usage_count: How many times each clip has been used
+        recent_indices: Recent clip indices used (for recency penalty)
+        clip_sources: Source type per clip ('local' or 'stock'), or None if not available
+    """
     ranked: list[tuple[float, int]] = []
-    recent_window = recent_indices[-6:]
+    
+    # Convert to sets for O(1) membership testing (faster than list `in` checks)
+    recent_window_set = set(recent_indices[-6:])
+    recent_8 = recent_indices[-8:]
+    recent_8_set = set(recent_8)
+    recent_20_set = set(recent_indices[-20:])
+    last_idx = recent_indices[-1] if recent_indices else None
+    
+    # Count local vs. stock usage in recent selections
+    local_usage_recent = 0
+    stock_usage_recent = 0
+    if clip_sources:
+        for idx in recent_20_set:
+            if idx < len(clip_sources):
+                if clip_sources[idx] == 'local':
+                    local_usage_recent += 1
+                else:
+                    stock_usage_recent += 1
+    
     for idx, score in enumerate(base_scores):
-        diversity_penalty = usage_count[idx] * 0.25
-        recency_penalty = 0.30 if idx in recent_window else 0.0
-        final_score = score - diversity_penalty - recency_penalty
+        # Aggressive diversity penalty: exponential growth as usage increases
+        # This strongly prevents clip repetition, especially for local clips
+        base_diversity_penalty = (usage_count[idx] ** 1.5) * 0.22
+        additional_reuse = max(0, usage_count[idx] - 3)
+        diversity_penalty = base_diversity_penalty + additional_reuse * 0.35
+        
+        # Recency penalties - prevent immediate repeats
+        if last_idx is not None and idx == last_idx:
+            recency_penalty = 1.2  # Strong penalty for immediate repeat
+        elif len(recent_indices) >= 2 and idx == recent_indices[-2]:
+            recency_penalty = 0.75  # Strong penalty for recent use
+        elif idx in recent_window_set:
+            recency_penalty = 0.45  # Moderate penalty
+        else:
+            recency_penalty = 0.0
+        
+        # Streak penalty: if a clip appears multiple times in the recent window
+        # Count manually from small list for efficiency
+        recent_hits = recent_8.count(idx)
+        streak_penalty = 0.0
+        if recent_hits >= 2:
+            streak_penalty = 0.35 * (recent_hits - 1)
+        
+        # Local clip balance penalty: if we've overused local clips recently, 
+        # prefer stock clips to maintain variety
+        local_balance_penalty = 0.0
+        if clip_sources and idx < len(clip_sources):
+            if clip_sources[idx] == 'local' and local_usage_recent > stock_usage_recent + 3:
+                local_balance_penalty = 0.40
+        
+        final_score = score - diversity_penalty - recency_penalty - streak_penalty - local_balance_penalty
         ranked.append((final_score, idx))
-
+    
     ranked.sort(key=lambda item: item[0], reverse=True)
     if not ranked:
         return 0
-
+    
     top_score, top_idx = ranked[0]
-    for alt_score, alt_idx in ranked[1:4]:
-        if top_idx in recent_window and alt_idx not in recent_window and (top_score - alt_score) <= 0.16:
+    
+    # Prefer variety: if top pick is very recent and another is close, pick the fresh one
+    if top_idx in recent_window_set:
+        for alt_score, alt_idx in ranked[1:8]:
+            if alt_idx not in recent_window_set and (top_score - alt_score) <= 0.35:
+                return alt_idx
+    
+    # Avoid immediate A-A repeats unless score gap is very large
+    if last_idx is not None and top_idx == last_idx:
+        for alt_score, alt_idx in ranked[1:8]:
+            if alt_idx != last_idx and (top_score - alt_score) <= 0.50:
+                return alt_idx
+    
+    # If top is recent and good alternatives exist, prefer fresh material
+    for alt_score, alt_idx in ranked[1:6]:
+        if top_idx in recent_window_set and alt_idx not in recent_window_set and (top_score - alt_score) <= 0.20:
             return alt_idx
+    
     return top_idx
 
 
@@ -530,9 +702,14 @@ def assign_clips(
         return []
 
     clip_descriptions = [_clip_description(path) for path in clip_paths]
+    # Pre-compute all clip tokens once to avoid redundant tokenization
+    clip_tokens_list = [_tokenize(desc) for desc in clip_descriptions]
 
     # Resolve cache dir relative to the project root (parent of any clips folder).
     clip_cache_dir = clip_paths[0].parent / "_clip_cache"
+
+    # Determine which clips are local vs. stock (stock clips typically in _stock_cache)
+    clip_sources = ["stock" if "_stock_cache" in str(path) else "local" for path in clip_paths]
 
     # Tier 1: CLIP visual matching — encode all clip frames once, then per-scene
     # just encode the text and dot-product. No per-scene video I/O.
@@ -563,6 +740,10 @@ def assign_clips(
     for scene_idx, (segment, pidx) in enumerate(zip(visual_plan, plan_indices), start=1):
         scene_text = (segment.text or "").strip() or "voiceover"
         scene_query = (segment.visual_query or "").strip() or _scene_query(scene_text)
+        
+        # Cache keywords for this scene (used in logging and scoring)
+        scene_keywords = suggest_scene_keywords(scene_text)
+        scene_query_tokens = _tokenize(scene_query)
 
         if clip_model is not None:
             text_vec = _clip_text_embedding(clip_model, clip_processor, scene_query)
@@ -583,27 +764,38 @@ def assign_clips(
         else:
             base_scores = [_lexical_similarity(scene_query, desc) for desc in clip_descriptions]
 
-        # Blend normalised visual score with lightweight metadata signals.
-        scores = [
-            base
-            + _movement_score(desc) * 0.4
-            + _keyword_relevance_score(scene_query, desc) * 0.4
-            + _theme_alignment_score(scene_query, desc) * 0.4
-            for base, desc in zip(base_scores, clip_descriptions)
-        ]
+        # Blend normalised visual score with improved metadata signals.
+        # Pre-compute scoring components for each clip efficiently.
+        movement_terms = {"running", "walking", "flying", "waves", "action", "dynamic", "motion", "drone", "timelapse", "closeup", "close-up"}
+        scores = []
+        for idx, (base, clip_toks) in enumerate(zip(base_scores, clip_tokens_list)):
+            # Movement score: intersection with movement terms
+            movement_score = min(0.35, len(clip_toks.intersection(movement_terms)) * 0.08)
+            
+            # Keyword relevance using pre-computed query keywords
+            kw_score = _keyword_relevance_score_fast(scene_keywords, clip_toks)
+            
+            # Theme alignment
+            theme_score = _theme_alignment_score_fast(scene_query_tokens, clip_toks)
+            
+            scores.append(
+                base * 0.45
+                + movement_score * 0.30
+                + kw_score * 0.55
+                + theme_score * 0.35
+            )
 
-        chosen_idx = _select_best_index(scores, usage_count, recent_indices)
+        chosen_idx = _select_best_index(scores, usage_count, recent_indices, clip_sources)
         clip_path = clip_paths[chosen_idx]
         usage_count[chosen_idx] += 1
         recent_indices.append(chosen_idx)
 
         if log:
-            keywords = suggest_scene_keywords(scene_text)
             score_str = f"{scores[chosen_idx]:.3f}" if scores else "?"
             log(
                 f"Scene {scene_idx}: [{backend}={score_str}] "
-                f"keywords={', '.join(keywords)} | "
-                f"query='{scene_query}' | emotion={segment.emotion} | chosen={clip_path.name}"
+                f"keywords={', '.join(scene_keywords)} | "
+                f"query='{scene_query}' | emotion={segment.emotion} | chosen={clip_path.name} ({clip_sources[chosen_idx]})"
             )
 
         end = cursor + segment.duration
@@ -621,3 +813,103 @@ def assign_clips(
         )
         cursor = end
     return timeline
+
+
+def find_low_confidence_segments(
+    plan: list[PlannedSegment],
+    clip_paths: list[Path],
+    log: callable | None = None,
+    min_best_score: float = 0.60,
+    max_segments: int = 10,
+) -> list[PlannedSegment]:
+    """Return segments where local clip pool appears weak for the planned scene query.
+
+    This is used to decide whether stock fetching is needed when local clips exist.
+    """
+    if not plan:
+        return []
+    if not clip_paths:
+        return list(plan[: max(1, int(max_segments))])
+
+    visual_plan, _plan_indices = _build_visual_plan(plan)
+    if not visual_plan:
+        return []
+
+    clip_descriptions = [_clip_description(path) for path in clip_paths]
+    clip_cache_dir = clip_paths[0].parent / "_clip_cache"
+    
+    # Pre-compute all clip tokens once to avoid redundant tokenization
+    clip_tokens_list = [_tokenize(desc) for desc in clip_descriptions]
+
+    clip_model, clip_processor = _load_clip_backend(log)
+    clip_embeddings: list = []
+    if clip_model is not None:
+        clip_embeddings = _precompute_clip_embeddings(
+            clip_model, clip_processor, clip_paths, clip_cache_dir, log
+        )
+
+    embedder = None if clip_model is not None else _load_embedding_backend(log)
+    backend = "clip" if clip_model is not None else ("sentence-transformers" if embedder is not None else "keyword")
+
+    low_confidence: list[PlannedSegment] = []
+    seen_queries: set[str] = set()
+    scores_seen: list[float] = []
+    movement_terms = {"running", "walking", "flying", "waves", "action", "dynamic", "motion", "drone", "timelapse", "closeup", "close-up"}
+
+    for segment in visual_plan:
+        scene_text = (segment.text or "").strip() or "voiceover"
+        scene_query = (segment.visual_query or "").strip() or _scene_query(scene_text)
+        
+        # Cache for this scene
+        scene_keywords = suggest_scene_keywords(scene_text)
+        scene_query_tokens = _tokenize(scene_query)
+
+        if clip_model is not None:
+            text_vec = _clip_text_embedding(clip_model, clip_processor, scene_query)
+            if text_vec is not None:
+                base_scores = _clip_scores_from_embeddings(text_vec, clip_embeddings)
+            else:
+                base_scores = [0.0] * len(clip_paths)
+
+            min_s = min(base_scores) if base_scores else 0.0
+            max_s = max(base_scores) if base_scores else 1.0
+            spread = max(max_s - min_s, 1e-6)
+            base_scores = [(s - min_s) / spread for s in base_scores]
+        elif embedder is not None:
+            base_scores = _semantic_scores(embedder, scene_query, clip_descriptions)
+        else:
+            base_scores = [_lexical_similarity(scene_query, desc) for desc in clip_descriptions]
+
+        # Efficient scoring with pre-computed tokens
+        scores = []
+        for base, clip_toks in zip(base_scores, clip_tokens_list):
+            movement_score = min(0.35, len(clip_toks.intersection(movement_terms)) * 0.08)
+            kw_score = _keyword_relevance_score_fast(scene_keywords, clip_toks)
+            theme_score = _theme_alignment_score_fast(scene_query_tokens, clip_toks)
+            scores.append(
+                base * 0.4
+                + movement_score * 0.4
+                + kw_score * 0.4
+                + theme_score * 0.4
+            )
+        best = max(scores) if scores else 0.0
+        scores_seen.append(best)
+
+        if best < float(min_best_score):
+            query_key = scene_query.lower().strip()
+            if query_key in seen_queries:
+                continue
+            seen_queries.add(query_key)
+            low_confidence.append(segment)
+            if len(low_confidence) >= max(1, int(max_segments)):
+                break
+
+    if log:
+        avg_best = (sum(scores_seen) / len(scores_seen)) if scores_seen else 0.0
+        log(
+            "Local coverage scan: "
+            f"backend={backend} | avg-best-score={avg_best:.3f} | "
+            f"weak-scenes={len(low_confidence)}"
+        )
+
+    return low_confidence
