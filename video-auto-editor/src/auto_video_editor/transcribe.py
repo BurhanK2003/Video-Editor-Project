@@ -2,7 +2,10 @@
 
 from pathlib import Path
 
-from moviepy.editor import AudioFileClip
+try:
+    from moviepy.editor import AudioFileClip
+except Exception:
+    from moviepy import AudioFileClip
 
 from .models import TranscriptSegment, WordToken
 

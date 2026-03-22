@@ -31,6 +31,9 @@ AUDIO_FILE_TYPES = "*.wav *.mp3 *.m4a *.aac *.flac *.ogg"
 
 
 class AutoEditorApp:
+    _DEFAULT_OUTPUT_PATH = str((Path.cwd() / "output" / "edited_video.mp4").resolve())
+    _DEFAULT_BATCH_OUTPUT_PATH = str((Path.cwd() / "output" / "batch").resolve())
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Local Auto Video Editor")
@@ -42,7 +45,7 @@ class AutoEditorApp:
         self.music_var = tk.StringVar()
         self.stock_keywords_var = tk.StringVar()
         self.output_var = tk.StringVar(
-            value=str((Path.cwd() / "output" / "edited_video.mp4").resolve())
+            value=self._DEFAULT_OUTPUT_PATH
         )
         self.width_var = tk.IntVar(value=1080)
         self.height_var = tk.IntVar(value=1920)
@@ -66,10 +69,17 @@ class AutoEditorApp:
         self.enable_progress_bar_var = tk.BooleanVar(value=True)
         self.batch_voiceovers_var = tk.StringVar()
         self.batch_manifest_var = tk.StringVar()
-        self.batch_output_var = tk.StringVar(value=str((Path.cwd() / "output" / "batch").resolve()))
+        self.batch_output_var = tk.StringVar(value=self._DEFAULT_BATCH_OUTPUT_PATH)
         # Script-to-video
         self.script_text_var = tk.StringVar()
         self.script_voice_var = tk.StringVar(value="en-US-AriaNeural")
+        self.enable_ollama_scene_planning_var = tk.BooleanVar(value=True)
+        self.ollama_scene_budget_var = tk.IntVar(value=8)
+        self.enable_ollama_critic_var = tk.BooleanVar(value=True)
+        self.match_scene_shortlist_var = tk.IntVar(value=28)
+        self.auto_optimize_runtime_var = tk.BooleanVar(value=True)
+        self.avoid_clip_repetition_var = tk.BooleanVar(value=True)
+        self.clip_repeat_cooldown_var = tk.IntVar(value=8)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -169,12 +179,7 @@ class AutoEditorApp:
             label="Stock Search",
             text_var=self.stock_keywords_var,
         )
-        self._path_row(
-            controls_frame,
-            label="Music (File/Folder)",
-            text_var=self.music_var,
-            browse_command=self._pick_music_source,
-        )
+        self._music_path_row(controls_frame)
         self._path_row(
             controls_frame,
             label="Output File",
@@ -252,13 +257,13 @@ class AutoEditorApp:
         ).grid(row=3, column=1, padx=8, pady=6, sticky="w")
 
         ttk.Label(settings, text="Engine").grid(row=3, column=2, padx=8, pady=6, sticky="w")
-        ttk.Label(settings, text="35/25/20/10/10 weighted cut mix").grid(
+        ttk.Label(settings, text="40/30/20/10 weighted cut mix").grid(
             row=3, column=3, columnspan=3, padx=8, pady=6, sticky="w"
         )
 
         ttk.Label(
             settings,
-            text="zoom punch 6f | smash 1f | whip 4f | glitch 3f | fade 2-4f",
+            text="zoom punch 6f | smash 1f | whip 4f | fade 2-4f",
             foreground="grey",
         ).grid(row=4, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w")
 
@@ -279,6 +284,49 @@ class AutoEditorApp:
             state="readonly",
             width=10,
         ).grid(row=5, column=3, padx=8, pady=6, sticky="w")
+
+        ttk.Checkbutton(
+            settings,
+            text="Use Ollama structured scene planning",
+            variable=self.enable_ollama_scene_planning_var,
+        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Checkbutton(
+            settings,
+            text="Run Ollama critic refinement pass",
+            variable=self.enable_ollama_critic_var,
+        ).grid(row=6, column=3, columnspan=3, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Label(settings, text="Ollama Scene Budget").grid(row=7, column=0, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(settings, from_=0, to=32, textvariable=self.ollama_scene_budget_var, width=10).grid(
+            row=7, column=1, padx=8, pady=6, sticky="w"
+        )
+
+        ttk.Label(settings, text="Match Shortlist").grid(row=7, column=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(settings, from_=8, to=80, textvariable=self.match_scene_shortlist_var, width=10).grid(
+            row=7, column=3, padx=8, pady=6, sticky="w"
+        )
+
+        ttk.Label(settings, text="Lower budget/shortlist = faster; higher = smarter matching", foreground="grey").grid(
+            row=8, column=0, columnspan=6, padx=8, pady=(0, 6), sticky="w"
+        )
+
+        ttk.Checkbutton(
+            settings,
+            text="Auto optimize runtime by project size",
+            variable=self.auto_optimize_runtime_var,
+        ).grid(row=9, column=0, columnspan=3, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Checkbutton(
+            settings,
+            text="Avoid clip repetition",
+            variable=self.avoid_clip_repetition_var,
+        ).grid(row=9, column=3, columnspan=2, padx=8, pady=(2, 6), sticky="w")
+
+        ttk.Label(settings, text="Repeat Cooldown").grid(row=10, column=0, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(settings, from_=2, to=24, textvariable=self.clip_repeat_cooldown_var, width=10).grid(
+            row=10, column=1, padx=8, pady=6, sticky="w"
+        )
 
         subtitle_style = ttk.LabelFrame(controls_frame, text="Subtitle Styling Editor", padding=8)
         subtitle_style.pack(fill="x", pady=(0, 8))
@@ -379,6 +427,9 @@ class AutoEditorApp:
         self.batch_button = ttk.Button(logs_pane, text="Batch Auto Edit", command=self._start_batch_auto_edit)
         self.batch_button.pack(fill="x", pady=(0, 10))
 
+        self.reset_button = ttk.Button(logs_pane, text="Reset All", command=self._reset_defaults)
+        self.reset_button.pack(fill="x", pady=(0, 10))
+
         logs_label = ttk.Label(logs_pane, text="Pipeline Log")
         logs_label.pack(anchor="w")
 
@@ -435,6 +486,15 @@ class AutoEditorApp:
         ttk.Label(row, text=label, width=20).pack(side="left")
         ttk.Entry(row, textvariable=text_var).pack(side="left", fill="x", expand=True)
 
+    def _music_path_row(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=4)
+
+        ttk.Label(row, text="Music (File/Folder)", width=20).pack(side="left")
+        ttk.Entry(row, textvariable=self.music_var).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="File", command=self._pick_music_file).pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="Folder", command=self._pick_music_folder).pack(side="left")
+
     def _pick_voiceover(self) -> None:
         selected = filedialog.askopenfilename(
             title="Select Voiceover",
@@ -450,13 +510,19 @@ class AutoEditorApp:
             self.clips_var.set(selected)
 
     def _pick_music_source(self) -> None:
+        self._pick_music_file()
+
+    def _pick_music_file(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Select Music File (or Cancel to choose folder)",
+            title="Select Music File",
             initialdir=str(Path.cwd()),
             filetypes=[("Audio Files", AUDIO_FILE_TYPES)],
         )
-        if not selected:
-            selected = filedialog.askdirectory(title="Select Music Folder", initialdir=str(Path.cwd()))
+        if selected:
+            self.music_var.set(selected)
+
+    def _pick_music_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Select Music Folder", initialdir=str(Path.cwd()))
         if selected:
             self.music_var.set(selected)
 
@@ -573,6 +639,13 @@ class AutoEditorApp:
             enable_progress_bar=self.enable_progress_bar_var.get(),
             script_text=script_text,
             script_voice=script_voice,
+            enable_ollama_scene_planning=self.enable_ollama_scene_planning_var.get(),
+            ollama_scene_budget=max(0, int(self.ollama_scene_budget_var.get())),
+            enable_ollama_critic=self.enable_ollama_critic_var.get(),
+            match_scene_shortlist=max(8, int(self.match_scene_shortlist_var.get())),
+            auto_optimize_runtime=self.auto_optimize_runtime_var.get(),
+            avoid_clip_repetition=self.avoid_clip_repetition_var.get(),
+            clip_repeat_cooldown=max(2, int(self.clip_repeat_cooldown_var.get())),
         )
 
     def _start_auto_edit(self) -> None:
@@ -651,6 +724,13 @@ class AutoEditorApp:
             enable_progress_bar=self.enable_progress_bar_var.get(),
             script_text="",
             script_voice="",
+            enable_ollama_scene_planning=self.enable_ollama_scene_planning_var.get(),
+            ollama_scene_budget=max(0, int(self.ollama_scene_budget_var.get())),
+            enable_ollama_critic=self.enable_ollama_critic_var.get(),
+            match_scene_shortlist=max(8, int(self.match_scene_shortlist_var.get())),
+            auto_optimize_runtime=self.auto_optimize_runtime_var.get(),
+            avoid_clip_repetition=self.avoid_clip_repetition_var.get(),
+            clip_repeat_cooldown=max(2, int(self.clip_repeat_cooldown_var.get())),
         )
 
     def _start_batch_auto_edit(self) -> None:
@@ -731,6 +811,58 @@ class AutoEditorApp:
         self.batch_button.configure(state="normal")
         self._append_log(f"Error: {error}")
         messagebox.showerror("Auto Edit Failed", error)
+
+    def _reset_defaults(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showinfo("In Progress", "Please wait for the current job to finish before resetting.")
+            return
+
+        # Clear all path/text inputs.
+        self.voiceover_var.set("")
+        self.clips_var.set("")
+        self.music_var.set("")
+        self.stock_keywords_var.set("")
+        self.output_var.set(self._DEFAULT_OUTPUT_PATH)
+        self.logo_path_var.set("")
+        self.batch_voiceovers_var.set("")
+        self.batch_manifest_var.set("")
+        self.batch_output_var.set(self._DEFAULT_BATCH_OUTPUT_PATH)
+        self.stat_badge_text_var.set("")
+        self.cta_text_var.set("")
+
+        # Restore all settings to initial defaults.
+        self.width_var.set(1080)
+        self.height_var.set(1920)
+        self.fps_var.set(24)
+        self.render_speed_var.set("Fast")
+        self.allow_stock_fetch_var.set(True)
+        self.transition_style_var.set("Professional Weighted")
+        self.transition_duration_var.set(0.22)
+        self.caption_style_var.set("Bold Stroke")
+        self.whisper_model_var.set("base")
+        self.caption_position_ratio_var.set(0.54)
+        self.caption_max_lines_var.set(3)
+        self.caption_font_scale_var.set(1.00)
+        self.caption_pop_scale_var.set(1.00)
+        self.adaptive_safe_zones_var.set(True)
+        self.karaoke_highlight_var.set(True)
+        self.enable_motion_overlays_var.set(False)
+        self.enable_progress_bar_var.set(True)
+        self.script_voice_var.set("en-US-AriaNeural")
+        self.enable_ollama_scene_planning_var.set(True)
+        self.ollama_scene_budget_var.set(8)
+        self.enable_ollama_critic_var.set(True)
+        self.match_scene_shortlist_var.set(28)
+        self.auto_optimize_runtime_var.set(True)
+        self.avoid_clip_repetition_var.set(True)
+        self.clip_repeat_cooldown_var.set(8)
+
+        # Clear script text editor and log panel.
+        self.script_text_widget.delete("1.0", "end")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self._append_log("Reset to defaults.")
 
 
 def run_app() -> None:

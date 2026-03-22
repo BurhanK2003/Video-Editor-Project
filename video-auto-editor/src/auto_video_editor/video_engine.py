@@ -53,8 +53,21 @@ class VideoEngine:
 
         model_size = str(config.get("whisper_model", "base"))
         segments = transcribe_voiceover(voiceover_path=voiceover, model_size=model_size, log=self._log)
-        plan = build_plan(segments, log=self._log)
-        timeline = assign_clips(plan, available_clips, log=self._log)
+        plan = build_plan(
+            segments,
+            log=self._log,
+            enable_ollama_scene_planning=bool(config.get("enable_ollama_scene_planning", True)),
+            ollama_scene_budget=int(config.get("ollama_scene_budget", 8)),
+            enable_ollama_critic=bool(config.get("enable_ollama_critic", True)),
+        )
+        timeline = assign_clips(
+            plan,
+            available_clips,
+            log=self._log,
+            scene_shortlist=int(config.get("match_scene_shortlist", 28)),
+            avoid_clip_repetition=bool(config.get("avoid_clip_repetition", True)),
+            clip_repeat_cooldown=int(config.get("clip_repeat_cooldown", 8)),
+        )
         selected_music_track = resolve_music_track(
             Path(music_path) if music_path else None,
             voiceover_path=voiceover,

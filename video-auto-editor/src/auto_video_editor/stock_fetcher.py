@@ -45,6 +45,8 @@ MAX_RESULTS_PER_KEYWORD = 5
 MAX_DOWNLOADS_PER_KEYWORD = 3
 USER_AGENT = "local-auto-video-editor/1.0"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SEED_FETCH_PER_PROVIDER = 2
+MAX_PROVIDER_QUERY_SLICE = 6
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,12 @@ def _build_provider_adapters() -> list[StockProviderAdapter]:
             api_key_env="PIXABAY_API_KEY",
             fetch_fn=_download_images_from_pixabay,
         ),
+        StockProviderAdapter(
+            name="YouTube Creative Commons",
+            cache_subdir="youtube_cc",
+            api_key_env=None,
+            fetch_fn=_download_videos_from_youtube_cc,
+        ),
     ]
 
 
@@ -118,33 +126,42 @@ def fetch_stock_clips(
 
     queries = _build_queries(plan, keywords_override)
     target_count = _target_clip_count(plan=plan, queries=queries, keywords_override=keywords_override)
+    # Fetch a small headroom to improve per-scene best-match quality while keeping runtime bounded.
+    candidate_target = max(target_count, min(target_count + 4, int(target_count * 1.35)))
     cache_dir = output_path.parent / "_stock_cache"
     downloaded: list[Path] = []
     seen_paths: set[Path] = set()
 
     if keywords_override.strip():
         log(f"Manual stock hint(s): {keywords_override.strip()}")
-    log(f"Stock keyword count: {len(queries)} | Target downloaded clips: {target_count}")
+    log(
+        f"Stock keyword count: {len(queries)} | "
+        f"Target clips: {target_count} | candidate pool target: {candidate_target}"
+    )
     if queries:
         preview = "; ".join(queries[:4])
         log(f"Stock query preview: {preview}")
 
-    for adapter in enabled_adapters:
-        if len(downloaded) >= target_count:
-            break
-
+    def _run_provider(
+        adapter: StockProviderAdapter,
+        *,
+        provider_queries: list[str],
+        provider_target: int,
+    ) -> None:
+        nonlocal downloaded
+        if provider_target <= 0:
+            return
         key = provider_keys.get(adapter.api_key_env or "", "") if adapter.api_key_env else ""
-        remaining = target_count - len(downloaded)
         try:
             if adapter.api_key_env:
                 downloaded.extend(
                     adapter.fetch_fn(
                         api_key=key,
-                        queries=queries,
+                        queries=provider_queries,
                         cache_dir=cache_dir / adapter.cache_subdir,
                         width=width,
                         height=height,
-                        target_count=remaining,
+                        target_count=provider_target,
                         seen_paths=seen_paths,
                         log=log,
                     )
@@ -152,11 +169,11 @@ def fetch_stock_clips(
             else:
                 downloaded.extend(
                     adapter.fetch_fn(
-                        queries=queries,
+                        queries=provider_queries,
                         cache_dir=cache_dir / adapter.cache_subdir,
                         width=width,
                         height=height,
-                        target_count=remaining,
+                        target_count=provider_target,
                         seen_paths=seen_paths,
                         log=log,
                     )
@@ -164,7 +181,160 @@ def fetch_stock_clips(
         except Exception as exc:
             log(f"Provider '{adapter.name}' failed: {exc}")
 
-    return downloaded
+    # Phase 1: quick seed from each provider for source diversity with low latency.
+    seed_queries = queries[: max(2, min(MAX_PROVIDER_QUERY_SLICE, len(queries)))]
+    for adapter in enabled_adapters:
+        if len(downloaded) >= candidate_target:
+            break
+        _run_provider(
+            adapter,
+            provider_queries=seed_queries,
+            provider_target=min(SEED_FETCH_PER_PROVIDER, max(0, candidate_target - len(downloaded))),
+        )
+
+    # Phase 2: expand by score potential until candidate pool target is met.
+    if len(downloaded) < candidate_target:
+        for adapter in enabled_adapters:
+            if len(downloaded) >= candidate_target:
+                break
+            _run_provider(
+                adapter,
+                provider_queries=queries[: max(2, min(len(queries), MAX_PROVIDER_QUERY_SLICE + 4))],
+                provider_target=max(0, candidate_target - len(downloaded)),
+            )
+
+    if enabled_adapters:
+        provider_names = ", ".join(adapter.name for adapter in enabled_adapters)
+        log(f"Enabled stock providers: {provider_names}")
+
+    # Keep pool bounded for downstream matcher runtime.
+    return downloaded[:candidate_target]
+
+
+def _download_videos_from_youtube_cc(
+    queries: list[str],
+    cache_dir: Path,
+    width: int,
+    height: int,
+    target_count: int,
+    seen_paths: set[Path],
+    log: callable,
+) -> list[Path]:
+    del width, height
+    try:
+        import yt_dlp
+    except Exception:
+        log("YouTube CC provider skipped: install yt-dlp to enable Creative Commons downloads.")
+        return []
+
+    results: list[Path] = []
+    for query in queries[:6]:
+        if len(results) >= target_count:
+            break
+
+        search_term = f"ytsearch5:{query} b roll creative commons"
+        probe_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": False,
+            "ignoreerrors": True,
+            "socket_timeout": 15,
+        }
+        try:
+            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                info = ydl.extract_info(search_term, download=False) or {}
+        except Exception as exc:
+            log(f"YouTube CC search failed for '{query}': {exc}")
+            continue
+
+        entries = info.get("entries") or []
+        if not isinstance(entries, list):
+            continue
+
+        for entry in entries:
+            if len(results) >= target_count:
+                break
+            if not isinstance(entry, dict):
+                continue
+
+            video_id = str(entry.get("id") or "").strip()
+            webpage_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+            license_text = str(entry.get("license") or "").strip().lower()
+            title = str(entry.get("title") or "").strip()
+
+            if not video_id or not webpage_url:
+                continue
+
+            # Keep this provider restricted to explicit CC metadata when available.
+            if license_text and "creative commons" not in license_text and "cc" not in license_text:
+                continue
+
+            destination = cache_dir / f"ytcc_{video_id}.mp4"
+            if destination in seen_paths:
+                continue
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists() and destination.stat().st_size > 0:
+                seen_paths.add(destination)
+                _write_metadata_sidecar(
+                    destination,
+                    {
+                        "provider": "youtube-cc",
+                        "query": query,
+                        "title": title,
+                        "tags": "youtube,creative-commons",
+                    },
+                )
+                log(f"Using cached stock clip: {destination.name}")
+                results.append(destination)
+                continue
+
+            outtmpl = str(destination.with_suffix("")) + ".%(ext)s"
+            dl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/best[ext=mp4]/best",
+                "outtmpl": outtmpl,
+                "merge_output_format": "mp4",
+                "ignoreerrors": True,
+                "socket_timeout": 20,
+            }
+            try:
+                with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                    ydl.download([webpage_url])
+            except Exception as exc:
+                log(f"YouTube CC download failed for '{title or video_id}': {exc}")
+                continue
+
+            produced = destination if destination.exists() else None
+            if produced is None:
+                candidates = sorted(destination.parent.glob(f"ytcc_{video_id}.*"))
+                for candidate in candidates:
+                    if candidate.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"} and candidate.stat().st_size > 0:
+                        produced = candidate
+                        break
+
+            if produced is None:
+                continue
+
+            seen_paths.add(produced)
+            _write_metadata_sidecar(
+                produced,
+                {
+                    "provider": "youtube-cc",
+                    "query": query,
+                    "title": title,
+                    "tags": "youtube,creative-commons",
+                },
+            )
+            log(f"Downloaded stock clip: {produced.name}")
+            results.append(produced)
+            break
+
+    return results
 
 
 def _build_queries(plan: list[PlannedSegment], keywords_override: str) -> list[str]:

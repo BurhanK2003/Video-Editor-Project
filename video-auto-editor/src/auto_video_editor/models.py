@@ -41,6 +41,8 @@ class TimelineClip:
     source_path: Path
     timeline_start: float
     timeline_end: float
+    source_start: float | None = None
+    source_end: float | None = None
     transition_after: bool = True
     transition_seconds: float = 0.2
     transition_type: str = "jump_cut"
@@ -79,3 +81,10 @@ class AutoEditRequest:
     # Script-to-video: supply a script instead of a pre-recorded voiceover.
     script_text: str = ""
     script_voice: str = ""  # edge-tts voice name, e.g. "en-US-AriaNeural"; empty = auto
+    enable_ollama_scene_planning: bool = True
+    ollama_scene_budget: int = 8
+    enable_ollama_critic: bool = True
+    match_scene_shortlist: int = 28
+    auto_optimize_runtime: bool = True
+    avoid_clip_repetition: bool = True
+    clip_repeat_cooldown: int = 8

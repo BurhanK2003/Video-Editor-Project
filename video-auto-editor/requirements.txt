@@ -1,10 +1,17 @@
-moviepy==2.2.1
+moviepy==1.0.3
 pillow==11.3.0
 numpy==2.4.3
 pydub==0.25.1
 imageio-ffmpeg==0.6.0
 faster-whisper==1.1.1
 librosa==0.11.0
+scenedetect==0.6.7
+opencv-python==4.11.0.86
+faiss-cpu==1.13.2
+
+# Optional for async online fetch (Pexels/Pixabay). If install fails on Windows,
+# pipeline falls back to local-only matching for that run.
+# aiohttp==3.11.13
 
 # --- Optional: AI upgrades (install for best quality) ---
 
@@ -16,6 +23,10 @@ librosa==0.11.0
 # Sentence-transformer text matching (fallback when CLIP is unavailable).
 # pip install sentence-transformers
 # sentence-transformers
+
+# Optional YouTube Creative Commons stock fetch provider.
+# pip install yt-dlp
+# yt-dlp
 
 # Faster Whisper transcription (better accuracy & speed than base whisper).
 # pip install faster-whisper

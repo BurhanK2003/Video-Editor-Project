@@ -6,7 +6,11 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import ImageClip, VideoClip
+
+try:
+    from moviepy.editor import ImageClip, VideoClip
+except Exception:
+    from moviepy import ImageClip, VideoClip
 
 from .models import PlannedSegment
 

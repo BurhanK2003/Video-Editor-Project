@@ -1,19 +1,53 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import import_module
 import math
 import os
 import random
 import re
 from pathlib import Path
+from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from moviepy.audio.AudioClip import AudioClip
 from moviepy.audio.AudioClip import CompositeAudioClip
 from moviepy.audio.AudioClip import concatenate_audioclips
-from moviepy.audio.fx.all import audio_fadein, audio_fadeout, audio_loop
-from moviepy.editor import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip, concatenate_videoclips
+
+try:
+    # MoviePy 2.x style (effect classes).
+    AudioFadeIn = import_module("moviepy.audio.fx.AudioFadeIn").AudioFadeIn
+    AudioFadeOut = import_module("moviepy.audio.fx.AudioFadeOut").AudioFadeOut
+    AudioLoop = import_module("moviepy.audio.fx.AudioLoop").AudioLoop
+
+    def audio_fadein(clip, duration):
+        return clip.with_effects([AudioFadeIn(float(duration))])
+
+    def audio_fadeout(clip, duration):
+        return clip.with_effects([AudioFadeOut(float(duration))])
+
+    def audio_loop(clip, duration):
+        return clip.with_effects([AudioLoop(duration=float(duration))])
+except Exception:
+    # MoviePy 1.x style via dynamic import to avoid static-analysis false positives.
+    _fx_all = import_module("moviepy.audio.fx.all")
+    audio_fadein = _fx_all.audio_fadein
+    audio_fadeout = _fx_all.audio_fadeout
+    audio_loop = _fx_all.audio_loop
+
+try:
+    # MoviePy 2.x exports these from top-level package.
+    from moviepy import AudioFileClip, CompositeVideoClip, ImageClip, VideoClip, VideoFileClip, concatenate_videoclips
+except Exception:
+    # MoviePy 1.x fallback via dynamic import.
+    _editor = import_module("moviepy.editor")
+    AudioFileClip = _editor.AudioFileClip
+    CompositeVideoClip = _editor.CompositeVideoClip
+    ImageClip = _editor.ImageClip
+    VideoClip = _editor.VideoClip
+    VideoFileClip = _editor.VideoFileClip
+    concatenate_videoclips = _editor.concatenate_videoclips
 
 from .models import PlannedSegment, TimelineClip, WordToken
 from .overlays import create_motion_graphics_overlays
@@ -21,10 +55,9 @@ from .overlays import create_motion_graphics_overlays
 TRANSITION_STYLES = ("none", "pro_weighted")
 SEGMENT_TRANSITIONS = ("jump_cut", "zoom_in", "whip", "fade")
 PRO_TRANSITION_WEIGHTS = (
-    ("zoom_punch", 0.35),
-    ("smash_cut", 0.25),
+    ("zoom_punch", 0.40),
+    ("smash_cut", 0.30),
     ("whip_pan", 0.20),
-    ("glitch_cut", 0.10),
     ("fade_black", 0.10),
 )
 
@@ -41,6 +74,63 @@ MUSIC_FADE_IN_SECONDS = 0.85
 MUSIC_FADE_OUT_SECONDS = 1.10
 CAPTION_IN_POP_SECONDS = 0.08
 CAPTION_OUT_FADE_SECONDS = 0.10
+
+
+def _subclip(clip, start_time: float = 0.0, end_time: float | None = None):
+    """Compatibility shim: MoviePy 1.x uses subclip, MoviePy 2.x uses subclipped."""
+    if hasattr(clip, "subclip"):
+        if end_time is None:
+            return clip.subclip(start_time)
+        return clip.subclip(start_time, end_time)
+    if hasattr(clip, "subclipped"):
+        if end_time is None:
+            return clip.subclipped(start_time)
+        return clip.subclipped(start_time, end_time)
+    raise AttributeError("Clip object does not support subclip/subclipped")
+
+
+def _resize(clip, *, width: int | None = None, height: int | None = None):
+    if hasattr(clip, "resize"):
+        return clip.resize(width=width, height=height)
+    if hasattr(clip, "resized"):
+        return clip.resized(width=width, height=height)
+    raise AttributeError("Clip object does not support resize/resized")
+
+
+def _crop(clip, *, x_center: float, y_center: float, width: int, height: int):
+    if hasattr(clip, "crop"):
+        return clip.crop(x_center=x_center, y_center=y_center, width=width, height=height)
+    if hasattr(clip, "cropped"):
+        x1 = max(0, int(round(x_center - width / 2)))
+        y1 = max(0, int(round(y_center - height / 2)))
+        x2 = x1 + int(width)
+        y2 = y1 + int(height)
+        return clip.cropped(x1=x1, y1=y1, x2=x2, y2=y2)
+    raise AttributeError("Clip object does not support crop/cropped")
+
+
+def _set_duration(clip, duration: float):
+    if hasattr(clip, "set_duration"):
+        return clip.set_duration(duration)
+    if hasattr(clip, "with_duration"):
+        return clip.with_duration(duration)
+    raise AttributeError("Clip object does not support set_duration/with_duration")
+
+
+def _set_audio(clip, audio_clip):
+    if hasattr(clip, "set_audio"):
+        return clip.set_audio(audio_clip)
+    if hasattr(clip, "with_audio"):
+        return clip.with_audio(audio_clip)
+    raise AttributeError("Clip object does not support set_audio/with_audio")
+
+
+def _set_position(clip, position):
+    if hasattr(clip, "set_position"):
+        return clip.set_position(position)
+    if hasattr(clip, "with_position"):
+        return clip.with_position(position)
+    raise AttributeError("Clip object does not support set_position/with_position")
 
 CAPTION_STYLE_PRESETS = {
     "bold_stroke": {
@@ -114,25 +204,25 @@ EMPHASIS_HINT_WORDS = {
 }
 
 
-def _fit_clip_to_canvas(clip: VideoFileClip, width: int, height: int) -> VideoFileClip:
+def _fit_clip_to_canvas(clip: Any, width: int, height: int) -> Any:
     """Scale to fill target frame and center-crop to preserve aspect ratio."""
     target_ratio = width / height
     source_ratio = clip.w / clip.h
 
     if source_ratio > target_ratio:
-        resized = clip.resize(height=height)
+        resized = _resize(clip, height=height)
     else:
-        resized = clip.resize(width=width)
+        resized = _resize(clip, width=width)
 
-    return resized.crop(x_center=resized.w / 2, y_center=resized.h / 2, width=width, height=height)
+    return _crop(resized, x_center=resized.w / 2, y_center=resized.h / 2, width=width, height=height)
 
 
 def _apply_micro_zooms(
-    clip: VideoFileClip,
+    clip: Any,
     pulse_every: float = MICRO_ZOOM_EVERY_SECONDS,
     pulse_seconds: float = MICRO_ZOOM_PULSE_SECONDS,
     strength: float = MICRO_ZOOM_STRENGTH,
-) -> VideoFileClip:
+) -> Any:
     """Apply periodic micro-zoom pulses to keep visuals feeling active.
 
     Pulses are subtle and brief to avoid seasickness while still improving retention.
@@ -171,6 +261,9 @@ def _deterministic_unit_interval(seed_key: str) -> float:
 
 
 def _micro_zoom_params_for_shot(shot: TimelineClip) -> tuple[bool, float, float, float]:
+    # Pulse-style micro zooms are disabled by request to keep motion cleaner.
+    return False, MICRO_ZOOM_EVERY_SECONDS, MICRO_ZOOM_PULSE_SECONDS, MICRO_ZOOM_STRENGTH
+
     shot_duration = max(0.0, float(shot.timeline_end - shot.timeline_start))
     if shot_duration < 1.15:
         return False, MICRO_ZOOM_EVERY_SECONDS, MICRO_ZOOM_PULSE_SECONDS, MICRO_ZOOM_STRENGTH
@@ -422,11 +515,11 @@ def _load_caption_font_bold(height: int, scale: float = 1.0) -> ImageFont.ImageF
 
 
 def _apply_ken_burns(
-    clip: VideoClip,
+    clip: Any,
     zoom_ratio: float = 0.08,
     pan_ratio: float = 0.08,
     seed_key: str = "",
-) -> VideoClip:
+) -> Any:
     """Apply a deterministic Ken Burns pan+zoom for still-image motion."""
     w, h = int(clip.w), int(clip.h)
     digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
@@ -492,11 +585,11 @@ def _build_trimmed_voiceover(
         gap = max(0.0, seg_start - prev_end)
         keep_gap = min(gap, max_gap_keep)
         if keep_gap > 0.0:
-            audio_parts.append(source.subclip(prev_end, prev_end + keep_gap))
+            audio_parts.append(_subclip(source, prev_end, prev_end + keep_gap))
             cursor += keep_gap
         trimmed_gap_total += max(0.0, gap - keep_gap)
 
-        part = source.subclip(seg_start, seg_end)
+        part = _subclip(source, seg_start, seg_end)
         audio_parts.append(part)
 
         new_start = cursor
@@ -534,7 +627,7 @@ def _build_trimmed_voiceover(
     # Keep a tiny tail so the final spoken word does not sound clipped.
     tail = min(0.12, max(0.0, float(source.duration) - prev_end))
     if tail > 0:
-        audio_parts.append(source.subclip(prev_end, prev_end + tail))
+        audio_parts.append(_subclip(source, prev_end, prev_end + tail))
 
     if not audio_parts:
         return source, subtitle_plan
@@ -621,11 +714,11 @@ def _apply_horizontal_motion_blur(frame: np.ndarray, offset: int) -> np.ndarray:
 
 
 def _apply_tail_frames(
-    clip: VideoClip,
+    clip: Any,
     fps: int,
     frame_count: int,
     transform,
-) -> VideoClip:
+) -> Any:
     duration = float(clip.duration or 0.0)
     if duration <= 0.0 or frame_count <= 0:
         return clip
@@ -647,11 +740,11 @@ def _apply_tail_frames(
 
 
 def _apply_head_frames(
-    clip: VideoClip,
+    clip: Any,
     fps: int,
     frame_count: int,
     transform,
-) -> VideoClip:
+) -> Any:
     duration = float(clip.duration or 0.0)
     if duration <= 0.0 or frame_count <= 0:
         return clip
@@ -670,7 +763,7 @@ def _apply_head_frames(
     return clip.fl(_frame, keep_duration=True)
 
 
-def _apply_zoom_punch_outgoing(clip: VideoClip, fps: int) -> VideoClip:
+def _apply_zoom_punch_outgoing(clip: Any, fps: int) -> Any:
     return _apply_tail_frames(
         clip,
         fps=fps,
@@ -679,7 +772,7 @@ def _apply_zoom_punch_outgoing(clip: VideoClip, fps: int) -> VideoClip:
     )
 
 
-def _apply_whip_pan_outgoing(clip: VideoClip, fps: int, direction: int) -> VideoClip:
+def _apply_whip_pan_outgoing(clip: Any, fps: int, direction: int) -> Any:
     return _apply_tail_frames(
         clip,
         fps=fps,
@@ -691,7 +784,7 @@ def _apply_whip_pan_outgoing(clip: VideoClip, fps: int, direction: int) -> Video
     )
 
 
-def _apply_smash_cut_incoming(clip: VideoClip, fps: int) -> VideoClip:
+def _apply_smash_cut_incoming(clip: Any, fps: int) -> Any:
     return _apply_head_frames(
         clip,
         fps=fps,
@@ -700,25 +793,12 @@ def _apply_smash_cut_incoming(clip: VideoClip, fps: int) -> VideoClip:
     )
 
 
-def _apply_glitch_cut_incoming(clip: VideoClip, fps: int, direction: int) -> VideoClip:
-    offsets = [20, 12, 6]
-    return _apply_head_frames(
-        clip,
-        fps=fps,
-        frame_count=3,
-        transform=lambda frame, idx, _total, _progress: _apply_rgb_split(
-            frame,
-            offsets[min(idx, len(offsets) - 1)] * (1 if direction >= 0 else -1),
-        ),
-    )
-
-
 def _apply_fade_black_pair(
-    outgoing: VideoClip,
-    incoming: VideoClip,
+    outgoing: Any,
+    incoming: Any,
     fps: int,
     frame_count: int,
-) -> tuple[VideoClip, VideoClip]:
+) -> tuple[Any, Any]:
     outgoing_fx = _apply_tail_frames(
         outgoing,
         fps=fps,
@@ -735,12 +815,12 @@ def _apply_fade_black_pair(
 
 
 def _compose_with_adaptive_transitions(
-    clips: list[VideoClip],
+    clips: list[Any],
     transition_plan: list[TimelineClip],
     style: str,
     fps: int,
     size: tuple[int, int],
-) -> tuple[VideoClip, int, dict[str, int]]:
+) -> tuple[Any, int, dict[str, int]]:
     """Build a frame-accurate professional cut timeline from the plan."""
     if not clips:
         raise ValueError("No clips to compose")
@@ -775,8 +855,6 @@ def _compose_with_adaptive_transitions(
             prepared[cut_idx] = _apply_whip_pan_outgoing(prepared[cut_idx], fps=fps, direction=direction)
         elif effect == "smash_cut":
             prepared[cut_idx + 1] = _apply_smash_cut_incoming(prepared[cut_idx + 1], fps=fps)
-        elif effect == "glitch_cut":
-            prepared[cut_idx + 1] = _apply_glitch_cut_incoming(prepared[cut_idx + 1], fps=fps, direction=direction)
         elif effect == "fade_black":
             fade_frames = rng.choice((2, 3, 4))
             prepared[cut_idx], prepared[cut_idx + 1] = _apply_fade_black_pair(
@@ -992,7 +1070,7 @@ def _frame_saliency_center_y(frame: np.ndarray) -> float:
 
 
 def _adaptive_caption_position_ratio(
-    base_video: VideoFileClip | CompositeVideoClip | None,
+    base_video: Any | None,
     segment_start: float,
     segment_end: float,
     default_ratio: float,
@@ -1229,10 +1307,10 @@ def _subtitle_overlays(
     caption_max_lines: int | None = None,
     caption_font_scale: float = 1.0,
     caption_pop_scale: float = 1.0,
-    base_video: VideoFileClip | CompositeVideoClip | None = None,
+    base_video: Any | None = None,
     enable_adaptive_caption_safe_zones: bool = True,
     enable_karaoke_highlight: bool = True,
-) -> list[VideoClip]:
+) -> list[Any]:
     if not subtitle_plan:
         return []
 
@@ -1251,7 +1329,7 @@ def _subtitle_overlays(
     min_box_height = max(180, int(height * 0.16))
     max_box_height = max(min_box_height, int(height * 0.65))
     max_text_width = int(width * 0.84)
-    overlays: list[VideoClip] = []
+    overlays: list[Any] = []
     pos_cache: dict[int, float] = {}
 
     for segment in subtitle_plan:
@@ -1488,11 +1566,11 @@ def render_video(
         raise ValueError("No timeline clips available. Add clips in the clips folder.")
 
     assembled = []
-    opened_video_clips: list[VideoClip] = []
-    subtitle_clips: list[VideoClip] = []
-    overlay_clips: list[VideoClip] = []
+    opened_video_clips: list[Any] = []
+    subtitle_clips: list[Any] = []
+    overlay_clips: list[Any] = []
     voiceover_clip: AudioClip | None = None
-    music_clip: AudioFileClip | None = None
+    music_clip: Any | None = None
     final_video = None
 
     try:
@@ -1517,13 +1595,31 @@ def render_video(
             if clip.duration is not None and clip.duration <= 0:
                 continue
 
-            if clip.duration is not None and clip.duration < needed:
-                repeats = int(needed // clip.duration) + 1
-                extended = concatenate_videoclips([clip] * repeats).subclip(0, needed)
-            elif clip.duration is not None:
-                extended = clip.subclip(0, needed)
+            if shot.source_path.suffix.lower() in IMAGE_EXTENSIONS:
+                base_clip = clip
             else:
-                extended = clip.set_duration(needed)
+                source_start = max(0.0, float(shot.source_start or 0.0))
+                source_end = float(shot.source_end) if shot.source_end is not None else None
+                clip_duration = float(clip.duration or 0.0)
+                if clip_duration > 0 and source_start >= clip_duration:
+                    source_start = max(0.0, clip_duration - 0.25)
+                if source_end is not None and clip_duration > 0:
+                    source_end = min(max(source_start + 0.1, source_end), clip_duration)
+
+                if source_end is not None and source_end > source_start:
+                    base_clip = _subclip(clip, source_start, source_end)
+                elif source_start > 0 and clip_duration > source_start:
+                    base_clip = _subclip(clip, source_start, clip_duration)
+                else:
+                    base_clip = clip
+
+            if base_clip.duration is not None and base_clip.duration < needed:
+                repeats = int(needed // base_clip.duration) + 1
+                extended = _subclip(concatenate_videoclips([base_clip] * repeats), 0, needed)
+            elif base_clip.duration is not None:
+                extended = _subclip(base_clip, 0, needed)
+            else:
+                extended = base_clip.set_duration(needed)
 
             fitted = _fit_clip_to_canvas(extended, width=width, height=height)
             should_zoom, cycle, pulse_seconds, strength = _micro_zoom_params_for_shot(shot)
@@ -1586,7 +1682,7 @@ def render_video(
 
         final_duration = voice_duration
         log(f"Voiceover duration: {voice_duration:.2f}s | Final duration: {final_duration:.2f}s")
-        final_video = final_video.subclip(0, final_duration)
+        final_video = _subclip(final_video, 0, final_duration)
 
         subtitle_clips = _subtitle_overlays(
             subtitle_plan=subtitle_plan,

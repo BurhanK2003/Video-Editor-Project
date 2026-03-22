@@ -30,7 +30,10 @@ def _safe_scalar(value: object, fallback: float = 0.0) -> float:
 
 def _audio_duration_seconds(path: Path) -> float | None:
     try:
-        from moviepy.editor import AudioFileClip
+        try:
+            from moviepy.editor import AudioFileClip
+        except Exception:
+            from moviepy import AudioFileClip
     except Exception:
         return None
 
